@@ -2453,6 +2453,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
+                    # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
+                    # during forward; provide a dummy so warmup doesn't crash.
+                    spec_info.hidden_states = torch.zeros(
+                        (num_tokens, self.model_config.hidden_size),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
             elif self.spec_algorithm.is_dflash():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
