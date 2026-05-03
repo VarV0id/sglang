@@ -12,6 +12,9 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_non_streaming
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_raw_http_streaming
 python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_tool_result_image_content_conversion
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_thinking_block_round_trip_to_reasoning_content
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_thinking_only_assistant_message_preserved
+python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServer.test_redacted_thinking_block_skipped
 """
 
 import json
@@ -146,6 +149,118 @@ class TestAnthropicServer(CustomTestCase):
             tool_message["content"][0]["image_url"]["url"],
             "data:image/png;base64,abcd",
         )
+
+    def test_thinking_block_round_trip_to_reasoning_content(self):
+        """Anthropic thinking blocks must round-trip as OpenAI reasoning_content.
+
+        Multi-turn agent loops (e.g. Qwen3-Coder thinking variants) require the
+        prior assistant turn's reasoning to be forwarded back to SGLang so the
+        chat template can decide whether to include it. Without this, prior
+        reasoning is silently dropped on every multi-turn request and the
+        `reasoning_content` field never reaches the underlying tokenizer.
+        """
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "What is 2+2?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "The user asked a simple math question.",
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "2+2 is 4.",
+                        },
+                        {"type": "text", "text": "4"},
+                    ],
+                },
+                {"role": "user", "content": "And 3+3?"},
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        assistant_messages = [
+            m for m in converted["messages"] if m.get("role") == "assistant"
+        ]
+        self.assertEqual(len(assistant_messages), 1)
+        assistant = assistant_messages[0]
+        self.assertEqual(
+            assistant.get("reasoning_content"),
+            "The user asked a simple math question.\n\n2+2 is 4.",
+        )
+        self.assertEqual(assistant.get("content"), "4")
+
+    def test_thinking_only_assistant_message_preserved(self):
+        """Assistant messages that carry only thinking blocks must not be
+        dropped. They previously fell through the empty-content guard and
+        disappeared from the converted history."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Plan a refactor."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "I should read the file first.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Continue."},
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        assistant_messages = [
+            m for m in converted["messages"] if m.get("role") == "assistant"
+        ]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertEqual(
+            assistant_messages[0].get("reasoning_content"),
+            "I should read the file first.",
+        )
+
+    def test_redacted_thinking_block_skipped(self):
+        """Encrypted thinking blocks have no plaintext to forward; conversion
+        must skip them silently without producing reasoning_content."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {"role": "user", "content": "Sensitive question."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "ENCRYPTED"},
+                        {"type": "text", "text": "Sorry, I cannot share."},
+                    ],
+                },
+                {"role": "user", "content": "OK."},
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        assistant_messages = [
+            m for m in converted["messages"] if m.get("role") == "assistant"
+        ]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertIsNone(assistant_messages[0].get("reasoning_content"))
+        self.assertEqual(assistant_messages[0].get("content"), "Sorry, I cannot share.")
 
     def test_simple_messages(self):
         """Test basic non-streaming message request."""
