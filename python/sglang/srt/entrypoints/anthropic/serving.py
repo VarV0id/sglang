@@ -192,6 +192,7 @@ class AnthropicServing:
             openai_msg = {"role": msg.role}
             content_parts = []
             tool_calls = []
+            reasoning_parts: list[str] = []
 
             for block in msg.content:
                 if block.type == "text" and block.text:
@@ -203,6 +204,22 @@ class AnthropicServing:
                     )
                     if image_part is not None:
                         content_parts.append(image_part)
+
+                elif block.type == "thinking" and block.thinking:
+                    # Round-trip extended-thinking blocks back to the underlying
+                    # model as `reasoning_content` on the assistant message.
+                    # Without this branch, prior-turn reasoning is silently
+                    # dropped on multi-turn agent loops, which breaks the
+                    # round-trip for thinking models that interleave reasoning
+                    # with tool calls (e.g. Qwen3-Coder thinking variants).
+                    # The chat template still decides whether to render prior
+                    # reasoning into the next prompt (e.g. Qwen3 strips by
+                    # default); we just stop discarding the signal here.
+                    reasoning_parts.append(block.thinking)
+
+                elif block.type == "redacted_thinking":
+                    # Encrypted thinking has no plaintext to forward; skip.
+                    continue
 
                 elif block.type == "tool_use":
                     tool_call = {
@@ -244,13 +261,19 @@ class AnthropicServing:
             if tool_calls:
                 openai_msg["tool_calls"] = tool_calls
 
+            # Attach reasoning content (assistant only). Joining with a blank
+            # line preserves block boundaries when an assistant turn carries
+            # multiple thinking segments interleaved with tool calls.
+            if reasoning_parts and msg.role == "assistant":
+                openai_msg["reasoning_content"] = "\n\n".join(reasoning_parts)
+
             # Attach content
             if content_parts:
                 if len(content_parts) == 1 and content_parts[0]["type"] == "text":
                     openai_msg["content"] = content_parts[0]["text"]
                 else:
                     openai_msg["content"] = content_parts
-            elif not tool_calls:
+            elif not tool_calls and not openai_msg.get("reasoning_content"):
                 continue
 
             openai_messages.append(openai_msg)
