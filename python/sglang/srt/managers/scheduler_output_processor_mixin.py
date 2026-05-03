@@ -198,6 +198,28 @@ class SchedulerOutputProcessorMixin:
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
+                    # Strip-thinking-cache mamba anchor: pin the end-of-prefill
+                    # mamba snapshot so cache_finished_req can pair the prompt
+                    # prefix KV with a consistent mamba state. Captured here
+                    # because the prefill kernel just wrote the snapshot at
+                    # mamba_last_track_seqlen into ping_pong[other(next_track_idx)].
+                    # Without this anchor, the snapshot gets overwritten at the
+                    # first mti boundary in decode and cache_finished_req asserts
+                    # cache_len != page_aligned_len. Gate on require_reasoning so
+                    # non-reasoning requests retain the full decode-time tracking.
+                    sa = get_global_server_args()
+                    if (
+                        sa.strip_thinking_cache
+                        and sa.enable_mamba_extra_buffer()
+                        and req.require_reasoning
+                        and req.mamba_ping_pong_track_buffer is not None
+                        and req.mamba_last_track_seqlen is not None
+                        and req.mamba_prompt_anchor_seqlen is None
+                    ):
+                        req.mamba_prompt_anchor_seqlen = (
+                            req.mamba_last_track_seqlen
+                        )
+
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
@@ -601,6 +623,15 @@ class SchedulerOutputProcessorMixin:
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
+            # When the prompt anchor is pinned (strip_thinking_cache + reasoning),
+            # suppress all decode-time ping-pong updates so the end-of-prefill
+            # snapshot in slot other(mamba_next_track_idx) is preserved for
+            # cache_finished_req. Without this guard the next mti boundary
+            # crossing during decode advances mamba_last_track_seqlen past
+            # the prompt end (e.g. 1472 -> 1536) and the kernel overwrites
+            # the anchor on the following boundary.
+            if req.mamba_prompt_anchor_seqlen is not None:
+                return
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
                 # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval

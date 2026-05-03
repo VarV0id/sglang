@@ -691,6 +691,14 @@ class Req(ReqDllmMixin):
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
+        # When set, freezes the mamba ping-pong snapshot at the end-of-prefill
+        # position so strip_thinking_cache can pair the prompt-prefix KV with a
+        # consistent mamba state. Set in process_batch_result_prefill once
+        # prefill is fully drained (is_chunked <= 0) and the request will
+        # produce reasoning content (require_reasoning + strip_thinking_cache).
+        # While set, decode-time mti boundary updates are suppressed so the
+        # snapshot in ping_pong[other(mamba_next_track_idx)] is preserved.
+        self.mamba_prompt_anchor_seqlen: Optional[int] = None
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
@@ -923,7 +931,17 @@ class Req(ReqDllmMixin):
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
+        # When extra_buffer mamba is enabled, the commit length must align
+        # with the mamba snapshot position so cache_finished_req's invariant
+        # `cache_len == page_aligned_len` holds. The snapshot is captured
+        # at FLA-aligned positions (mamba_cache_chunk_size = max(FLA_CHUNK_SIZE,
+        # page_size)), so we return the anchor seqlen recorded at end-of-prefill.
+        # Without anchoring, _cache_commit_len returns 1497 while
+        # mamba_last_track_seqlen advances to next mti boundary (e.g. 1536)
+        # during decode, tripping the assertion in mamba_radix_cache.py.
         if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
+            if self.mamba_prompt_anchor_seqlen is not None:
+                return self.mamba_prompt_anchor_seqlen
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
 
@@ -1244,6 +1262,7 @@ class Req(ReqDllmMixin):
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
+        self.mamba_prompt_anchor_seqlen = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv_allocated_len = 0
@@ -2351,8 +2370,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
             # async H2D
+            # Suppress kernel mti boundary writes for requests whose prompt
+            # mamba anchor is pinned (strip_thinking_cache + reasoning). The
+            # anchor is in ping_pong[other(mamba_next_track_idx)] and would be
+            # clobbered at the next mti boundary if we left the mask True.
+            anchored_mask = torch.tensor(
+                [r.mamba_prompt_anchor_seqlen is not None for r in self.reqs],
+                dtype=torch.bool,
+            )
             self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                (
+                    (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                    & ~anchored_mask
+                )
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
