@@ -160,6 +160,8 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name == "file":
             return backend_class(storage_config)
+        elif backend_name == "lru_file":
+            return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
@@ -192,6 +194,12 @@ class StorageBackendFactory:
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "lru_file",
+    "sglang.srt.mem_cache.storage.lru_file",
+    "LRUHiCacheFile",
 )
 
 StorageBackendFactory.register_backend(
