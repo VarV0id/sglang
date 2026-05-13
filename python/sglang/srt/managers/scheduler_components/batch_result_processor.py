@@ -710,6 +710,24 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
+            # Late anchor capture: process_batch_result_prefill captures the
+            # prompt anchor only when req.mamba_last_track_seqlen is already
+            # set at end-of-prefill, which is not always true (kernel writes
+            # the mamba snapshot but the tracking counter can be initialized
+            # lazily on the first decode update). If the prefill-time capture
+            # missed and we are entering the very first decode step, capture
+            # the anchor here before the first mti boundary advance overwrites
+            # the end-of-prefill snapshot slot. Matches the same gates as the
+            # prefill-time site.
+            if req.mamba_prompt_anchor_seqlen is None and len(req.output_ids) <= 1:
+                sa = get_global_server_args()
+                if (
+                    sa.strip_thinking_cache
+                    and sa.enable_mamba_extra_buffer()
+                    and req.require_reasoning
+                    and req.mamba_last_track_seqlen is not None
+                ):
+                    req.mamba_prompt_anchor_seqlen = req.mamba_last_track_seqlen
             # When the prompt anchor is pinned (strip_thinking_cache + reasoning),
             # suppress all decode-time ping-pong updates so the end-of-prefill
             # snapshot in slot other(mamba_next_track_idx) is preserved for

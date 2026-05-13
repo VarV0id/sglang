@@ -549,9 +549,35 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 page_aligned_len = len(kv_indices)
                 page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
-            assert (
-                cache_len == page_aligned_len
-            ), f"It is required {cache_len=}, {page_aligned_len=}, {kv_committed_len=}, {len(req.origin_input_ids)=}, {len(req.output_ids)=} ping @yizhang2077 if you see this"
+            # Defensive fallback for mamba state vs kv-commit drift.
+            # Upstream asserts cache_len == page_aligned_len here, which kills
+            # the entire scheduler process via SIGQUIT (see
+            # tokenizer_manager.running_phase_sigquit_handler) and takes down
+            # all in-flight requests. The drift has been observed with
+            # --strip-thinking-cache + extra_buffer when the prompt-anchor fix
+            # misses an edge case (e.g. reasoning request whose anchor capture
+            # didn't fire at end-of-prefill). Skip the insert for this request
+            # and free its KV/mamba state cleanly so refcounts stay consistent.
+            # The pod survives at the cost of losing one request's prefix-cache
+            # contribution.
+            if cache_len != page_aligned_len:
+                logger.warning(
+                    "mamba_radix_cache: cache_len=%d != page_aligned_len=%d "
+                    "[kv_committed_len=%d, origin_input_ids=%d, output_ids=%d]; "
+                    "skipping insert to avoid scheduler crash (defensive fallback). "
+                    "See fix(strip_thinking_cache) history in fork.",
+                    cache_len,
+                    page_aligned_len,
+                    kv_committed_len,
+                    len(req.origin_input_ids),
+                    len(req.output_ids),
+                )
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len :]
+                )
+                self.req_to_token_pool.free_mamba_cache(req)
+                self.dec_lock_ref(req.last_node)
+                return
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
