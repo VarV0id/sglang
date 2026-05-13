@@ -755,6 +755,7 @@ def embed_mm_inputs(
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
+    prealloc_deepstack: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
@@ -857,12 +858,16 @@ def embed_mm_inputs(
         deepstack_embedding_shape = input_embeds.shape[:-1] + (
             input_embeds.shape[-1] * num_deepstack_embeddings,
         )
-        # a zero-filled embedding, with the same length of input_embeds, but different hidden_size
-        input_deepstack_embeds = torch.zeros(
-            deepstack_embedding_shape,
-            device=input_embeds.device,
-            dtype=input_embeds.dtype,
-        )
+        if prealloc_deepstack is not None:
+            assert prealloc_deepstack.shape == deepstack_embedding_shape
+            input_deepstack_embeds = prealloc_deepstack
+            input_deepstack_embeds.zero_()
+        else:
+            input_deepstack_embeds = torch.zeros(
+                deepstack_embedding_shape,
+                device=input_embeds.device,
+                dtype=input_embeds.dtype,
+            )
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
@@ -1033,9 +1038,17 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
+            # prealloc_deepstack: pre-allocated deepstack embed buffer threaded
+            # in from PiecewiseCudaGraphRunner so embed_mm_inputs can reuse it
+            # via .zero_() instead of torch.zeros() — required to keep CUDA graph
+            # capture/replay address-stable (upstream PR #16785, fixes
+            # "PCG capture stream is not set" assertion on Qwen3-VL-family models).
+            prealloc_deepstack = kwargs.get("input_deepstack_embeds", None)
             server_args = get_global_server_args()
             if server_args and server_args.enable_adaptive_dispatch_to_encoder:
-                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches.
+                # TODO: thread prealloc_deepstack through _embed_mm_inputs_with_split as well; only matters
+                # when enable_adaptive_dispatch_to_encoder=True (not used in qwen27b).
                 input_embeds, other_info = _embed_mm_inputs_with_split(
                     mm_inputs_list=mm_inputs_list,
                     extend_prefix_lens=extend_prefix_lens,
@@ -1059,7 +1072,9 @@ def general_mm_embed_routine(
                     data_embedding_func_mapping=data_embedding_funcs,
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
+                    prealloc_deepstack=prealloc_deepstack,
                 )
+
 
             # add for qwen3_vl deepstack
             if use_deepstack:
