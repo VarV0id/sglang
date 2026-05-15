@@ -1433,6 +1433,10 @@ class HiMambaRadixCache(MambaRadixCache):
             for ack_id, entry in list(self.ongoing_backup.items()):
                 try:
                     node, mamba_host_protected = entry
+                    # Force-release path: drop any pending overflow slots
+                    # on the node before clearing it from ongoing_backup so
+                    # the ring doesn't leak when storage is being torn down.
+                    self._release_overflow_slots_for_node(node)
                     self._release_host_node(node, release_mamba=mamba_host_protected)
                 except Exception:
                     logger.exception(
@@ -1486,6 +1490,20 @@ class HiMambaRadixCache(MambaRadixCache):
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
                     node, mamba_host_protected = entry
+                    # --- Alt B archive-completion release ----------------
+                    # Release any overflow ring slots that were live for the
+                    # duration of this H->S write. We unconditionally release
+                    # regardless of per-key success (the slot must come back
+                    # to the ring even if the .mamba_*.bin write failed —
+                    # otherwise the ring leaks). Per-key success is logged
+                    # by the storage backend separately.
+                    self._release_overflow_slots_for_op(operation)
+                    # Clear the node's overflow stash so the node is not
+                    # treated as overflow-archive-pending by any later code
+                    # path (e.g. a future write_backup_storage call on the
+                    # same node, if hash_value or key changes).
+                    node._mamba_overflow_indices = None
+                    node._mamba_overflow_slot_ids = None
                     self._release_host_node(node, release_mamba=mamba_host_protected)
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
@@ -1697,7 +1715,14 @@ class HiMambaRadixCache(MambaRadixCache):
             prefix_keys,
             extra_pools=extra_pools,
         )
-        mamba_host_protected = extra_pools is not None
+        # Only protect the node's host-mamba refcount when there is a real
+        # host slot to protect. Overflow-backed nodes have
+        # mamba_host_value=None (the slot lives in the ring, not on the
+        # node) and their ring slot is kept alive by _mamba_overflow_slot_ids
+        # being non-empty until _drain_backup releases it.
+        mamba_host_protected = (
+            extra_pools is not None and node.mamba_host_value is not None
+        )
         self.ongoing_backup[operation_id] = (node, mamba_host_protected)
         self._protect_host_node(node, protect_mamba=mamba_host_protected)
 
@@ -1994,14 +2019,58 @@ class HiMambaRadixCache(MambaRadixCache):
         # store auto-allocated mamba host indices into the node after D→H backup
         if not transfers:
             return
-        host_indices = transfers[0].host_indices
+        tr = transfers[0]
+        host_indices = tr.host_indices
+        # --- Alt B overflow case --------------------------------------------
+        # When _resolve_pool_transfers_allocation handed back overflow slot
+        # indices instead of normal LRU slots, the indices DO point at valid
+        # rows in MambaPoolHost's tensors (the reserved range at the tail).
+        # However:
+        #   - These rows are evict-immune by design (LRU never sees them) and
+        #     get recycled by the ring as soon as the archive H->S write
+        #     completes, so they CANNOT serve future host->device restores.
+        #   - We therefore do NOT set node.mamba_host_value (which would mark
+        #     the node mamba_backuped=True and expose it to restore_transfers
+        #     reads of potentially-stale rows).
+        #   - We DO need to drive the H->S archive write, so the indices are
+        #     stashed in two transient attributes: _mamba_overflow_indices
+        #     (the torch.Tensor for the storage write) and
+        #     _mamba_overflow_slot_ids (list[int] for ring release after the
+        #     archive ack lands). Both are cleared in _drain_backup.
+        if tr.overflow_slot_ids:
+            if host_indices is not None:
+                node._mamba_overflow_indices = host_indices.clone()
+            else:  # pragma: no cover - defensive
+                node._mamba_overflow_indices = None
+            node._mamba_overflow_slot_ids = list(tr.overflow_slot_ids)
+            return
         if node.mamba_host_value is None and host_indices is not None:
             node.mamba_host_value = host_indices.clone()
             self.mamba_host_lru_list.insert_mru(node)
 
     def mamba_archive_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:
         # build H→Storage transfer descriptor for mamba state
-        if node.mamba_host_value is None or not node.hash_value:
+        if not node.hash_value:
+            return None
+        # --- Alt B overflow path -------------------------------------------
+        # Overflow-backed nodes have node.mamba_host_value=None (so they are
+        # invisible to read-side mamba_backuped gates) but carry their slot
+        # indices on _mamba_overflow_indices. We synthesise a PoolTransfer
+        # that re-attaches the overflow_slot_ids so the archive-completion
+        # drain in _drain_backup can release the slots back to the ring.
+        overflow_indices = getattr(node, "_mamba_overflow_indices", None)
+        overflow_slot_ids = getattr(node, "_mamba_overflow_slot_ids", None)
+        if overflow_indices is not None and overflow_slot_ids:
+            return [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=overflow_indices,
+                    keys=[node.hash_value[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    overflow_slot_ids=list(overflow_slot_ids),
+                )
+            ]
+        if node.mamba_host_value is None:
             return None
         return [
             PoolTransfer(
@@ -2011,6 +2080,58 @@ class HiMambaRadixCache(MambaRadixCache):
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
+
+    def _release_overflow_slots_for_op(self, operation) -> None:
+        """Release any overflow ring slots carried by an archive operation's
+        pool_transfers, and clear the per-node stash.
+
+        Called from _drain_backup after the archive H->S write acks. Must
+        run regardless of per-key success (a failed storage write still
+        means the slot needs to come back to the ring).
+        """
+        pool_transfers = getattr(operation, "pool_transfers", None)
+        if not pool_transfers:
+            return
+        host_pool = getattr(self, "mamba_pool_host", None)
+        release_fn = getattr(host_pool, "overflow_release", None)
+        if release_fn is None:
+            return
+        for tr in pool_transfers:
+            slot_ids = getattr(tr, "overflow_slot_ids", None)
+            if not slot_ids:
+                continue
+            for slot in slot_ids:
+                try:
+                    release_fn(int(slot))
+                except Exception:
+                    logger.exception(
+                        "Failed to release overflow slot %s for op %s",
+                        slot,
+                        getattr(operation, "id", "?"),
+                    )
+
+    def _release_overflow_slots_for_node(self, node: TreeNode) -> None:
+        """Force-release overflow slots stashed on a node (teardown path).
+
+        Used by the force-release branch that drains ongoing_backup when
+        storage is being torn down. Idempotent: clears the stash even if
+        the release helper isn't available.
+        """
+        slot_ids = getattr(node, "_mamba_overflow_slot_ids", None)
+        if slot_ids:
+            host_pool = getattr(self, "mamba_pool_host", None)
+            release_fn = getattr(host_pool, "overflow_release", None)
+            if release_fn is not None:
+                for slot in slot_ids:
+                    try:
+                        release_fn(int(slot))
+                    except Exception:
+                        logger.exception(
+                            "Failed to release overflow slot %s on teardown",
+                            slot,
+                        )
+        node._mamba_overflow_indices = None
+        node._mamba_overflow_slot_ids = None
 
     def mamba_prefetch_alloc(
         self,

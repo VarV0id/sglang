@@ -515,12 +515,21 @@ def build_hybrid_mamba_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
+    # Alt B: reserve overflow rows at the tail of the mamba host pool's
+    # tensors so write_backup can fall through to a pre-allocated ring when
+    # the LRU pool is full (otherwise the entire write batch — KV plus
+    # mamba — would be rolled back by the controller). Default 8 slots is
+    # enough to saturate ~3 GB/s NVMe per
+    # .planning/quick/20260503-l3-mamba-companion-recompute/PROPOSAL.md.
+    # Operator-tunable via --mamba-overflow-size N on ServerArgs.
+    mamba_overflow_size = getattr(server_args, "mamba_overflow_size", 8)
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
         server_args.hicache_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
+        overflow_size=mamba_overflow_size,
     )
     entries = [
         build_pool_entry(

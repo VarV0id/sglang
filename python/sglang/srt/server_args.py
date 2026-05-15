@@ -625,6 +625,14 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    # Alt B (per .planning/quick/260515-epq-alt-b-mamba-overflow/DESIGN-V2.md):
+    # number of pinned overflow rows reserved at the tail of the mamba host
+    # pool's tensors. Used when the LRU mamba pool is full at write_backup
+    # time. Default 8 saturates ~3 GB/s NVMe; raise to 16 if soak shows
+    # queueing. Set to 0 to disable overflow entirely (pre-Alt-B behaviour:
+    # mamba writebacks under contention will drop the .mamba_*.bin file AND
+    # roll back the KV write).
+    mamba_overflow_size: int = 8
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -5812,6 +5820,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-overflow-size",
+            type=int,
+            default=ServerArgs.mamba_overflow_size,
+            help=(
+                "Number of pinned overflow rows reserved at the tail of the "
+                "mamba host pool's tensors (Alt B). When the LRU mamba pool "
+                "is full at write_backup time, fall through to this ring so "
+                "the companion .mamba_*.bin file is still written AND the KV "
+                "write is not rolled back. Default 8 saturates ~3 GB/s NVMe; "
+                "raise to 16 if soak shows queueing. Set 0 to disable."
+            ),
         )
         parser.add_argument(
             "--mamba-backend",
