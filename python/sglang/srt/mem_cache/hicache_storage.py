@@ -488,6 +488,22 @@ class HiCacheFile(HiCacheStorage):
                         break
             if boundary:
                 hit_count[name] = boundary
+            # Alt B verification log: the mamba gate clipped a L3 hit. Pre-Alt-B
+            # this fires on every request that touches mamba (because
+            # companion coverage was ~0%); post-Alt-B it should be rare
+            # (only when the .mamba_*.bin write actually failed, e.g. ring
+            # saturation or NVMe error). The headline positive-control
+            # signal for the patch landing is the *frequency* of this log
+            # line dropping from per-request to rare. See PROPOSAL.md
+            # "Verification on our deployment".
+            if boundary < kv_pages and name == PoolName.MAMBA:
+                logger.debug(
+                    "L3 mamba gate clipped: kv_pages=%d -> mamba_boundary=%d "
+                    "(keys[-1]=%s)",
+                    kv_pages,
+                    boundary,
+                    transfer.keys[-1] if transfer.keys else "?",
+                )
             final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
