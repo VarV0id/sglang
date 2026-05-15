@@ -1743,6 +1743,16 @@ class HiMambaRadixCache(MambaRadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
+            logger.info(
+                "L3 prefetch skipped rid=%s prefetch_length=%d threshold=%d "
+                "matched_in_tree=%d enable_storage=%s rate_limited=%s",
+                req_id,
+                prefetch_length,
+                self.prefetch_threshold,
+                len(new_input_tokens) - prefetch_length,
+                self.enable_storage,
+                self.cache_controller.prefetch_rate_limited(),
+            )
             return
 
         self._protect_host_node(last_host_node, protect_mamba=False)
