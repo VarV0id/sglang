@@ -1196,7 +1196,20 @@ class MambaPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         layout: str = "layer_first",
+        overflow_size: int = 0,
     ):
+        # NOTE(Alt B): ``overflow_size`` reserves extra rows at the tail of the
+        # underlying temporal/conv buffers. Those rows are excluded from the
+        # normal LRU allocator (``free_slots`` only ranges over ``[0, size)``)
+        # but are otherwise indistinguishable from regular slots — every
+        # downstream consumer (D->H copy, get_data_page for storage write,
+        # backup_from_device_all_layer) treats them identically. The
+        # ``_MambaOverflowAllocator`` (constructed below) hands out absolute
+        # slot ids in ``[size, size + overflow_size)`` via ref-counted
+        # acquire/release. Set to 0 to disable overflow (default for safety).
+        # User-tunable via ``--mamba-overflow-size N`` on the server. See
+        # ``_mamba_overflow_buffer.py`` and
+        # ``.planning/quick/260515-epq-alt-b-mamba-overflow/DESIGN-V2.md``.
         self.device_pool = device_pool
         self.page_size = 1
         assert layout in [
@@ -1210,6 +1223,9 @@ class MambaPoolHost(HostKVCache):
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = device_pool.num_mamba_layers
+        # Captured here so ``init_kv_buffer`` (called below) can grow the
+        # tensor allocations to include the reserved overflow rows.
+        self.overflow_size = max(0, int(overflow_size))
 
         self.conv_state_shapes = [
             conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
@@ -1237,7 +1253,10 @@ class MambaPoolHost(HostKVCache):
         ), "The host memory should be larger than the device memory with the current protocol"
 
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
+        # The reserved overflow rows live at the tail of the same tensors,
+        # so include them in the budget check.
+        total_rows = self.size + self.overflow_size
+        requested_bytes = total_rows * self.size_per_token
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
@@ -1247,22 +1266,43 @@ class MambaPoolHost(HostKVCache):
                 f"size of the hierarchical cache."
             )
         logger.info(
-            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
+            "Allocating %.2f GB host memory for hierarchical Mamba cache "
+            "(layout=%s, normal_rows=%d, overflow_rows=%d).",
             requested_bytes / 1e9,
             self.layout,
+            self.size,
+            self.overflow_size,
         )
 
         self.init_kv_buffer()
         self.lock = threading.RLock()
         self.clear()
+        # Lazy import keeps this module dependency-free for non-mamba pools.
+        from sglang.srt.mem_cache._mamba_overflow_buffer import (
+            _MambaOverflowAllocator,
+        )
+
+        # Overflow allocator owns the [self.size, self.size + overflow_size)
+        # row range. When overflow_size==0 the allocator is a harmless no-op
+        # (acquire() always returns None) so the controller's getattr-gated
+        # fallback branch silently skips it.
+        self._overflow = _MambaOverflowAllocator(
+            base_idx=self.size, size=self.overflow_size
+        )
 
     def init_kv_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        # Reserved overflow rows live at the tail. ``total_rows`` is the
+        # physical buffer dimension; ``self.size`` remains the logical
+        # LRU-managed pool size. The normal allocator (free_slots) is
+        # initialised over ``[0, self.size)`` in clear(); rows
+        # ``[self.size, total_rows)`` are owned by ``self._overflow``.
+        total_rows = self.size + self.overflow_size
 
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
             temporal_dims = (
-                self.size,
+                total_rows,
                 self.num_mamba_layers,
                 1,
             ) + self.temporal_state_shape
@@ -1275,7 +1315,7 @@ class MambaPoolHost(HostKVCache):
             )
             self.conv_buffer = []
             for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
+                conv_dims = (total_rows, self.num_mamba_layers, 1) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
                         conv_dims,
@@ -1289,7 +1329,7 @@ class MambaPoolHost(HostKVCache):
             # layer-first: (num_layers, size, *shape)
             temporal_dims = (
                 self.num_mamba_layers,
-                self.size,
+                total_rows,
             ) + self.temporal_state_shape
             self.temporal_buffer = alloc_func(
                 temporal_dims,
@@ -1300,7 +1340,7 @@ class MambaPoolHost(HostKVCache):
             )
             self.conv_buffer = []
             for conv_shape in self.conv_state_shapes:
-                conv_dims = (self.num_mamba_layers, self.size) + conv_shape
+                conv_dims = (self.num_mamba_layers, total_rows) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
                         conv_dims,
@@ -1352,8 +1392,66 @@ class MambaPoolHost(HostKVCache):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        # Defensive: overflow slots must never be free()d back into the normal
+        # LRU pool. ``_overflow_release`` is the correct release path for those.
+        # We assert in debug builds; in production we filter to avoid
+        # corrupting free_slots if a caller misroutes a slot id.
+        if self.overflow_size > 0 and indices.numel() > 0:
+            max_normal = self.size - 1
+            if int(indices.max().item()) > max_normal:
+                logger.error(
+                    "MambaPoolHost.free called with overflow indices (max=%d, "
+                    "normal range=[0, %d]); filtering them out and routing to "
+                    "_overflow.release. This indicates a wiring bug.",
+                    int(indices.max().item()),
+                    max_normal,
+                )
+                mask = indices <= max_normal
+                overflow_mask = ~mask
+                # Release any stray overflow indices.
+                if overflow_mask.any():
+                    for slot in indices[overflow_mask].tolist():
+                        self._overflow.release(slot)
+                indices = indices[mask]
+                if indices.numel() == 0:
+                    return 0
         self.free_slots = torch.cat([self.free_slots, indices])
         return len(indices)
+
+    # --- Alt B overflow API ---------------------------------------------
+    # These methods are gated on ``getattr(host_pool, 'overflow_alloc', None)``
+    # in ``HybridCacheController._resolve_pool_transfers_allocation`` so
+    # non-mamba host pools (which never construct ``_overflow``) silently
+    # skip the fallback branch.
+
+    def overflow_alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        """Allocate ``need_size`` overflow slots; returns a tensor of absolute
+        slot indices or ``None`` if the overflow ring is also saturated.
+
+        Currently only supports ``need_size == 1`` (per-page mamba writeback);
+        callers requesting more get ``None`` so the controller falls through
+        to its existing rollback path.
+        """
+        if need_size != 1:
+            return None
+        slot = self._overflow.acquire()
+        if slot is None:
+            return None
+        self._overflow.log_if_due()
+        return torch.tensor([slot], dtype=torch.int64)
+
+    def overflow_release(self, slot_idx: int) -> None:
+        """Release one overflow slot back to the ring."""
+        self._overflow.release(slot_idx)
+        self._overflow.log_if_due()
+
+    def overflow_contains(self, slot_idx: int) -> bool:
+        """Whether ``slot_idx`` is in the reserved overflow range."""
+        return self._overflow.contains(slot_idx)
+
+    def overflow_stats(self) -> dict:
+        """Telemetry snapshot. See ``_MambaOverflowAllocator.stats``."""
+        return self._overflow.stats()
 
     def get_size_per_token(self):
         conv_total_size = sum(
