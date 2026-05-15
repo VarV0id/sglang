@@ -87,6 +87,12 @@ class PoolTransfer:
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
     nodes_to_load      : evicted nodes this transfer covers
+    overflow_slot_ids  : when host_indices were allocated from a host
+                         pool's reserved overflow ring (Alt B mamba
+                         writeback), this carries the absolute slot ids so
+                         the H->S archive commit hook can release them
+                         back to the ring. Default None means
+                         host_indices came from the normal LRU allocator.
     """
 
     name: PoolName
@@ -96,6 +102,7 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    overflow_slot_ids: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)

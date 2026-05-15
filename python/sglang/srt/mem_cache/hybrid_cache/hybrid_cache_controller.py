@@ -64,6 +64,13 @@ class CacheOperation(BaseCacheOperation):
             parts = [x for x in tensors if x is not None]
             return torch.cat(parts) if parts else None
 
+        def cat_overflow_slot_ids(transfers):
+            collected: list[int] = []
+            for t in transfers:
+                if t.overflow_slot_ids:
+                    collected.extend(t.overflow_slot_ids)
+            return collected or None
+
         return [
             PoolTransfer(
                 name=ts[0].name,
@@ -72,6 +79,9 @@ class CacheOperation(BaseCacheOperation):
                 keys=[k for t in ts if t.keys for k in t.keys] or None,
                 hit_policy=ts[0].hit_policy,
                 indices_from_pool=ts[0].indices_from_pool,
+                # Concatenated so the archive-completion drain can release
+                # every overflow slot included in the merged op.
+                overflow_slot_ids=cat_overflow_slot_ids(ts),
             )
             for ts in grouped.values()
         ]
@@ -590,12 +600,49 @@ class HybridCacheController(BaseHiCacheController):
             if indices is None and evict_fn:
                 evict_fn(size)
                 indices = alloc_fn(size)
+            overflow_slot_ids: Optional[list[int]] = None
+            if indices is None and alloc_host:
+                # Alt B overflow fallback. Only fires on the write side
+                # (alloc_host=True); the read side has no symmetric
+                # concept — a missing companion file is just a miss.
+                #
+                # Gated on ``getattr(host_pool, "overflow_alloc", None)`` so
+                # non-mamba host pools (which never define this attribute)
+                # silently skip the branch. The mamba host pool's
+                # overflow_alloc returns a tensor of absolute slot indices
+                # in [pool.size, pool.size + overflow_size) backed by the
+                # _MambaOverflowAllocator ring. These indices look exactly
+                # like normal slot indices to every downstream consumer
+                # (D->H copy, get_data_page for storage write); the only
+                # caller that needs to know they came from overflow is the
+                # archive-completion drain, which uses the
+                # overflow_slot_ids field below to release them back to
+                # the ring after the .mamba_*.bin file lands.
+                overflow_alloc = getattr(entry.host_pool, "overflow_alloc", None)
+                if overflow_alloc is not None:
+                    indices = overflow_alloc(size)
+                    if indices is not None:
+                        overflow_slot_ids = indices.tolist()
             if indices is None:
                 # Atomic rollback: free everything we successfully allocated.
                 rollback_allocated()
                 return None
             if alloc_host:
                 pool.host_indices = indices
+                if overflow_slot_ids is not None:
+                    pool.overflow_slot_ids = overflow_slot_ids
+                    # Use overflow_release for cleanup — free() would
+                    # corrupt free_slots.
+                    free_fn = getattr(
+                        entry.host_pool, "overflow_release_indices", None
+                    ) or (
+                        # Inline shim if the host pool only exposes
+                        # per-slot release.
+                        lambda idx_tensor: [
+                            entry.host_pool.overflow_release(int(s))
+                            for s in idx_tensor.tolist()
+                        ]
+                    )
             else:
                 pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
