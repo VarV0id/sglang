@@ -2083,6 +2083,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+        elif (
+            req.mamba_last_track_seqlen is None
+            and req.mamba_branching_seqlen is None
+            and len(req.prefix_indices) > 0
+        ):
+            # Inherit the snapshot position from the matched prefix when this
+            # extend is too small to write a new mamba snapshot
+            # (extend_input_len < mamba_cache_chunk_size). The radix match
+            # brought us a snapshot at len(prefix_indices); recording it lets
+            # cache_finished_req pair the prompt-prefix KV with that snapshot
+            # and lets the strip_thinking_cache anchor capture
+            # (process_batch_result_prefill, gated on mamba_last_track_seqlen
+            # is not None) fire at end-of-prefill instead of missing the
+            # capture window.
+            #
+            # Without this, mamba_last_track_seqlen stays None through prefill
+            # for sub-mti tail extends after a long cached prefix. The
+            # end-of-prefill anchor capture skips, the first decode-step late
+            # capture (209413f15) also skips, and the first mti boundary
+            # crossing during decode advances mamba_last_track_seqlen straight
+            # to (prompt_end // mti + 1) * mti -- off by exactly
+            # mti - (prompt_end % mti) tokens from the prompt end. At
+            # finish, cache_finished_req trips the cache_len != page_aligned_len
+            # defensive fallback (this repo's mamba_radix_cache:563), losing
+            # the entire request's cache-insert contribution.
+            #
+            # mamba_branching_seqlen is required to be None because a pending
+            # branching reconstruction means the snapshot expected at
+            # len(prefix_indices) does NOT exist yet -- only the snapshot at
+            # best_value_len does. Claiming one at len(prefix_indices) would
+            # misrepresent the mamba state. The sub-mti+branching combo is
+            # extremely rare (branching needs the kernel to reach the
+            # branching seqlen, which requires mask=True) so the existing
+            # defensive fallback continues to cover it.
+            req.mamba_last_track_seqlen = len(req.prefix_indices)
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def prepare_for_split_prefill(self):
