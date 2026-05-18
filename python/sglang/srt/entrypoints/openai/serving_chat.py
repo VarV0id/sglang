@@ -55,6 +55,10 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.residual_special_token_stripper import (
+    StreamingResidualStringStripper,
+    get_residual_special_token_strings,
+)
 
 _SSE_DATA_B = b"data: "
 _SSE_NL_B = b"\n\n"
@@ -236,6 +240,33 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or None.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+
+        # Residual special-token-string stripping (see
+        # residual_special_token_stripper.py). Some tokenizers register chat-
+        # template role markers (e.g. <|im_start|> for Qwen) as added tokens
+        # with special=True. The model occasionally emits the literal BPE
+        # bytes of those markers — when that happens, skip_special_tokens does
+        # not strip them because it filters by token ID, not string content.
+        # We collect the marker strings here once and reuse them per request.
+        self._residual_marker_strings: List[str] = []
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        if tokenizer is not None:
+            try:
+                self._residual_marker_strings = get_residual_special_token_strings(
+                    tokenizer
+                )
+                if self._residual_marker_strings:
+                    logger.info(
+                        "Residual special-token-string stripping enabled for "
+                        "%d marker(s) (skip_special_tokens=True requests only)",
+                        len(self._residual_marker_strings),
+                    )
+            except Exception as e:  # defensive — never fail server startup
+                logger.warning(
+                    "Could not enumerate residual special-token strings from "
+                    "tokenizer (%s); residual stripping disabled.",
+                    e,
+                )
 
     def _handle_last_assistant_message(
         self,
@@ -814,6 +845,13 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
+        # Per-request residual special-token-string strippers. Each index
+        # (n>1, parallel sampling) gets its own buffered stripper because the
+        # tokenizer-side state is independent across choices.
+        residual_stripper_dict: Dict[int, StreamingResidualStringStripper] = {}
+        residual_stripping_enabled = bool(
+            self._residual_marker_strings
+        ) and bool(getattr(request, "skip_special_tokens", True))
 
         # State tracking for streaming
         is_firsts = {}
@@ -914,6 +952,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 else:
                     delta = content["text"][offset:]
                 stream_offsets[index] = len(content["text"])
+
+                # Strip residual special-token *strings* (e.g. literal
+                # "<|im_start|>" bytes hallucinated by the model). This runs
+                # BEFORE the reasoning/tool parsers so they see a clean
+                # stream. The stripper is streaming-safe — markers split
+                # across chunks are buffered until completed.
+                if residual_stripping_enabled:
+                    stripper = residual_stripper_dict.get(index)
+                    if stripper is None:
+                        stripper = StreamingResidualStringStripper(
+                            self._residual_marker_strings
+                        )
+                        residual_stripper_dict[index] = stripper
+                    delta = stripper.feed(delta)
+                    if finish_reason_type is not None:
+                        delta += stripper.flush()
 
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
@@ -1142,6 +1196,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
+
+            # Strip residual special-token strings before parsers see them.
+            # Same rationale as the streaming path; here we can run a one-shot
+            # feed/flush since the full text is available.
+            if self._residual_marker_strings and getattr(
+                request, "skip_special_tokens", True
+            ):
+                _stripper = StreamingResidualStringStripper(
+                    self._residual_marker_strings
+                )
+                text = _stripper.feed(text) + _stripper.flush()
 
             # Handle reasoning content
             reasoning_text = None
