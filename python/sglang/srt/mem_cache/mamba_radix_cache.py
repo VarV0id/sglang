@@ -540,6 +540,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
 
+            # Clamp cache_len to the actual committed kv tensor length. With
+            # extra_buffer enabled, cache_len starts as mamba_last_track_seqlen
+            # (decode-tracker value) which can exceed kv_committed_len when the
+            # commit length comes from the strip_thinking_cache anchor (or its
+            # min(kv_committed_len, len(origin_input_ids)) fallback). Without
+            # this clamp, the cache_len vs page_aligned_len comparison below
+            # reports the pre-slice mamba seqlen instead of the post-slice kv
+            # range, making the warning log misleading.
+            cache_len = min(cache_len, len(kv_indices))
+
             if self.page_size != 1:
                 page_aligned_len = len(kv_indices) // self.page_size * self.page_size
                 page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
@@ -548,6 +558,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             else:
                 page_aligned_len = len(kv_indices)
                 page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+            # Sub-page prefix: nothing to insert at page granularity. Common
+            # when the commit length comes from the strip_thinking_cache
+            # fallback min(kv_committed_len, len(origin_input_ids)) and the
+            # request had a short prompt (< page_size). Free the kv/mamba and
+            # return without firing the cache_len != page_aligned_len warning,
+            # since there is no real drift — there is just nothing worth
+            # caching at this granularity.
+            if page_aligned_len == 0:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[req.cache_protected_len :]
+                )
+                self.req_to_token_pool.free_mamba_cache(req)
+                self.dec_lock_ref(req.last_node)
+                return
 
             # Defensive fallback for mamba state vs kv-commit drift.
             # Upstream asserts cache_len == page_aligned_len here, which kills
