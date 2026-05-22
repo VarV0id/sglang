@@ -512,13 +512,47 @@ class HybridCacheController(BaseHiCacheController):
         super()._page_transfer(operation)
 
     def _page_backup(self, operation):
-        # Backup extra pools
-        if operation.pool_transfers:
-            self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        # Backup extra pools (mamba). For hybrid Mamba+Attention models, the
+        # mamba companion file MUST be written alongside the KV file; an
+        # orphan KV-only L3 entry cannot be restored (read-side gate clamps
+        # mamba_boundary to 0, revoking the entire prefix).
+        #
+        # CRITICAL: when we skip the KV write, we MUST still mark the
+        # operation as completed so the caller's writing_check / ongoing_backup
+        # tracker releases its refcount on the host node. Without this,
+        # protect refcounts leak, mamba_host_lru can't evict, host pool
+        # never drains, and the entire scheduler eventually deadlocks
+        # (detokenizer heartbeat dies, requests pile up).
+        total_tokens = len(operation.hash_value) * self.page_size
 
-        # Backup kv pools
+        # Case 1: No mamba transfer attempted (host pool + overflow saturated
+        # at write_backup time, mamba_archive_transfers returned None).
+        # Refuse the KV write entirely — orphan creation begins here.
+        if not operation.pool_transfers:
+            logger.warning(
+                "Skipping orphan KV-only L3 write op=%s (no mamba transfer; "
+                "host mamba pool + overflow ring saturated)",
+                getattr(operation, "id", "?"),
+            )
+            operation.completed_tokens = total_tokens
+            return
+
+        # Case 2: Mamba transfer attempted. Check per-page results.
+        self._resolve_sidecar_derived_pool_transfers(operation)
+        results = self.storage_backend.batch_set_v2(operation.pool_transfers)
+        operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        for pool_name, page_results in results.items():
+            if not page_results or not all(page_results):
+                logger.warning(
+                    "Skipping KV L3 write op=%s: mamba batch_set_v2 had "
+                    "failed pages (pool=%s)",
+                    getattr(operation, "id", "?"),
+                    pool_name,
+                )
+                operation.completed_tokens = total_tokens
+                return
+
+        # Mamba write succeeded — safe to write KV.
         super()._page_backup(operation)
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):

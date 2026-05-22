@@ -6,8 +6,11 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import logging
+import random
 import time
 import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
@@ -49,6 +52,55 @@ STOP_REASON_MAP = {
     "length": "max_tokens",
     "tool_calls": "tool_use",
 }
+
+# Minimum max_tokens for Anthropic /v1/messages requests.
+# Qwen3.6 is a thinking model that emits <think>...</think> before content.
+# If max_tokens is too small, thinking consumes all tokens and no content
+# is produced. A minimum of 4096 provides headroom for typical thinking
+# (~300-800 tokens) plus content (~100-500 tokens).
+# Operator can override via SGLANG_ANTHROPIC_MIN_MAX_TOKENS env var.
+ANTHROPIC_MIN_MAX_TOKENS = int(os.environ.get("SGLANG_ANTHROPIC_MIN_MAX_TOKENS", "4096"))
+
+# Fallback text injected when a thinking model emits only a <think>...</think>
+# block followed by EOS, with no text/tool_use content. Without this fallback
+# the Anthropic response carries only a thinking block, and clients that
+# follow Anthropic's strict content contract (e.g. Claude Code) silently
+# drop the turn — surfacing as a stalled or empty continuation with no
+# error. Qwen3.6 exhibits this intermittently when </think> is generated
+# very early and <|im_end|> follows immediately.
+ANTHROPIC_EMPTY_TEXT_FALLBACK = os.environ.get(
+    "SGLANG_ANTHROPIC_EMPTY_TEXT_FALLBACK",
+    "(model produced a thinking block with no further content)",
+)
+
+# Server-side retry knobs for thinking-only responses.
+#
+# When the model emits only a <think>...</think> block with no text/tool_use,
+# we have two options before falling back to the placeholder text:
+#
+#   1. Re-issue the same request to the local backend with a fresh seed and a
+#      small temperature bump. Qwen3.6's short-thinking-stop is intermittent
+#      and largely seed-sensitive; a single retry usually produces a healthy
+#      thinking + content turn.
+#   2. Inject the static placeholder (patch #21, v10 behavior) so strict
+#      clients don't drop the turn.
+#
+# Path (1) is the primary fix; path (2) remains as a safety net if the retry
+# also produces a thinking-only response, errors out, or exceeds the budget.
+# Both knobs let an operator turn the retry off (RETRY_ENABLED=0) or tighten
+# the timeout without rebuilding the image.
+ANTHROPIC_THINKING_RETRY_ENABLED = os.environ.get(
+    "SGLANG_ANTHROPIC_THINKING_RETRY_ENABLED", "1"
+).lower() not in ("0", "false", "no", "off")
+ANTHROPIC_THINKING_RETRY_TEMP_BUMP = float(
+    os.environ.get("SGLANG_ANTHROPIC_THINKING_RETRY_TEMP_BUMP", "0.1")
+)
+ANTHROPIC_THINKING_RETRY_TIMEOUT_S = float(
+    os.environ.get("SGLANG_ANTHROPIC_THINKING_RETRY_TIMEOUT_S", "60")
+)
+# Hard upper bound on the perturbed temperature so a misconfigured base
+# temperature can't push the retry into degenerate sampling territory.
+ANTHROPIC_THINKING_RETRY_TEMP_CEILING = 1.5
 
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
@@ -278,11 +330,24 @@ class AnthropicServing:
 
             openai_messages.append(openai_msg)
 
+        # Enforce minimum max_tokens for thinking models.
+        # Without this, Qwen3.6 may consume the entire budget in <think>
+        # and produce no content, causing client retries.
+        max_tokens = anthropic_request.max_tokens
+        if max_tokens is not None and max_tokens < ANTHROPIC_MIN_MAX_TOKENS:
+            logger.info(
+                "Bumping max_tokens from %d to %d (SGLANG_ANTHROPIC_MIN_MAX_TOKENS) "
+                "to ensure room for thinking+content on Qwen3.6",
+                max_tokens,
+                ANTHROPIC_MIN_MAX_TOKENS,
+            )
+            max_tokens = ANTHROPIC_MIN_MAX_TOKENS
+
         # Build ChatCompletionRequest
         request_data = {
             "messages": openai_messages,
             "model": anthropic_request.model,
-            "max_tokens": anthropic_request.max_tokens,
+            "max_tokens": max_tokens,
             "stream": anthropic_request.stream or False,
         }
 
@@ -392,8 +457,78 @@ class AnthropicServing:
                 message="Internal processing error",
             )
 
-        # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        # Convert to Anthropic response. If the result would be thinking-only,
+        # try a perturbed retry before falling through to the placeholder.
+        anthropic_response = self._convert_response(response, inject_fallback=False)
+
+        has_thinking = any(b.type == "thinking" for b in anthropic_response.content)
+        has_text_or_tool = any(
+            b.type in ("text", "tool_use") for b in anthropic_response.content
+        )
+
+        if has_thinking and not has_text_or_tool and ANTHROPIC_THINKING_RETRY_ENABLED:
+            retry_resp = await self._retry_thinking_only(chat_request, raw_request)
+            if retry_resp is not None:
+                retry_text, retry_tool_calls = self._extract_retry_payload(retry_resp)
+                if retry_text or retry_tool_calls:
+                    logger.info(
+                        "Anthropic non-streaming thinking-only retry yielded "
+                        "usable content (text=%s, tool_calls=%d); replacing "
+                        "placeholder.",
+                        "yes" if retry_text else "no",
+                        len(retry_tool_calls),
+                    )
+                    # Append tool_use blocks for any tool_calls the retry
+                    # produced, then a text block for any retry text. Keep
+                    # the original thinking block already in content.
+                    for tc in retry_tool_calls:
+                        try:
+                            tc_input = json.loads(tc.function.arguments)
+                        except (json.JSONDecodeError, TypeError, AttributeError):
+                            tc_input = {}
+                        anthropic_response.content.append(
+                            AnthropicContentBlock(
+                                type="tool_use",
+                                id=tc.id,
+                                name=tc.function.name,
+                                input=tc_input,
+                            )
+                        )
+                    if retry_text:
+                        anthropic_response.content.append(
+                            AnthropicContentBlock(type="text", text=retry_text)
+                        )
+                    # Update stop_reason / usage to match what we actually
+                    # produced.
+                    if retry_tool_calls:
+                        anthropic_response.stop_reason = "tool_use"
+                    if retry_resp.usage is not None and anthropic_response.usage is not None:
+                        anthropic_response.usage.input_tokens += (
+                            retry_resp.usage.prompt_tokens or 0
+                        )
+                        anthropic_response.usage.output_tokens += (
+                            retry_resp.usage.completion_tokens or 0
+                        )
+                    has_text_or_tool = True
+
+        # If we still have thinking-only after the optional retry, inject the
+        # static placeholder so strict clients don't drop the turn.
+        if has_thinking and not has_text_or_tool:
+            logger.warning(
+                "Anthropic non-streaming response has only a thinking block "
+                "and retry produced no usable content; injecting fallback "
+                "text block to satisfy strict clients."
+            )
+            anthropic_response.content.append(
+                AnthropicContentBlock(type="text", text=ANTHROPIC_EMPTY_TEXT_FALLBACK)
+            )
+
+        # Structural minimum: if we have no content at all, emit empty text.
+        if not anthropic_response.content:
+            anthropic_response.content.append(
+                AnthropicContentBlock(type="text", text="")
+            )
+
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -468,6 +603,15 @@ class AnthropicServing:
         # can close + reopen when the underlying OpenAI stream switches
         # between text content and tool_calls within a single turn.
         content_block_type: Optional[str] = None
+        # Track what kinds of content we have actually emitted. Strict
+        # Anthropic clients (Claude Code) silently drop responses that
+        # contain only a `thinking` block — they require at least one
+        # text or tool_use block to register the turn. Qwen3.6 sometimes
+        # emits <think>...</think><|im_end|> with nothing after the
+        # closing think tag; we synthesize a fallback text block at
+        # [DONE] when that happens.
+        emitted_thinking = False
+        emitted_text_or_tool = False
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -492,6 +636,170 @@ class AnthropicServing:
                     )
                     content_block_open = False
                     content_block_type = None
+
+                # Fallback path: the model emitted only a thinking block
+                # (no text, no tool_use). Strict Anthropic clients (Claude
+                # Code) silently drop turns without text/tool_use, so we
+                # must surface SOMETHING. Try a perturbed retry first
+                # (patch #22), then fall through to the v10 placeholder.
+                if emitted_thinking and not emitted_text_or_tool:
+                    retry_text: Optional[str] = None
+                    retry_tool_calls: list = []
+                    if ANTHROPIC_THINKING_RETRY_ENABLED:
+                        retry_resp = await self._retry_thinking_only(
+                            processed_request, raw_request
+                        )
+                        if retry_resp is not None:
+                            retry_text, retry_tool_calls = (
+                                self._extract_retry_payload(retry_resp)
+                            )
+                            # Account retry usage into the totals reported
+                            # to the client so observability isn't lying
+                            # about the actual cost of this turn.
+                            if retry_resp.usage is not None:
+                                if usage_info is None:
+                                    usage_info = {
+                                        "input_tokens": 0,
+                                        "output_tokens": 0,
+                                    }
+                                usage_info["input_tokens"] = (
+                                    usage_info.get("input_tokens", 0)
+                                    + (retry_resp.usage.prompt_tokens or 0)
+                                )
+                                usage_info["output_tokens"] = (
+                                    usage_info.get("output_tokens", 0)
+                                    + (retry_resp.usage.completion_tokens or 0)
+                                )
+
+                    if retry_tool_calls or retry_text:
+                        logger.info(
+                            "Anthropic thinking-only retry yielded usable "
+                            "content (text=%s, tool_calls=%d); emitting "
+                            "instead of placeholder.",
+                            "yes" if retry_text else "no",
+                            len(retry_tool_calls),
+                        )
+                        # Emit tool_use blocks first (matches the order the
+                        # backend would have produced), then a text block
+                        # for any retry text.
+                        for tc in retry_tool_calls:
+                            content_block_index += 1
+                            try:
+                                tc_input = json.loads(tc.function.arguments)
+                            except (json.JSONDecodeError, TypeError, AttributeError):
+                                tc_input = {}
+                            start_event = AnthropicStreamEvent(
+                                type="content_block_start",
+                                index=content_block_index,
+                                content_block=AnthropicContentBlock(
+                                    type="tool_use",
+                                    id=tc.id or f"toolu_{uuid.uuid4().hex}",
+                                    name=tc.function.name,
+                                    input={},
+                                ),
+                            )
+                            yield _wrap_sse_event(
+                                start_event.model_dump_json(exclude_none=True),
+                                "content_block_start",
+                            )
+                            # Emit arguments as a single input_json_delta so
+                            # the SDK reassembles them into the input field.
+                            if tc.function.arguments:
+                                delta_event = AnthropicStreamEvent(
+                                    type="content_block_delta",
+                                    index=content_block_index,
+                                    delta=AnthropicDelta(
+                                        type="input_json_delta",
+                                        partial_json=tc.function.arguments,
+                                    ),
+                                )
+                                yield _wrap_sse_event(
+                                    delta_event.model_dump_json(exclude_none=True),
+                                    "content_block_delta",
+                                )
+                            stop_event = AnthropicStreamEvent(
+                                type="content_block_stop",
+                                index=content_block_index,
+                            )
+                            yield _wrap_sse_event(
+                                stop_event.model_dump_json(exclude_none=True),
+                                "content_block_stop",
+                            )
+                            # If we emitted at least one tool_use, the
+                            # turn's stop reason should reflect that.
+                            finish_reason = "tool_calls"
+
+                        if retry_text:
+                            content_block_index += 1
+                            start_event = AnthropicStreamEvent(
+                                type="content_block_start",
+                                index=content_block_index,
+                                content_block=AnthropicContentBlock(
+                                    type="text", text=""
+                                ),
+                            )
+                            yield _wrap_sse_event(
+                                start_event.model_dump_json(exclude_none=True),
+                                "content_block_start",
+                            )
+                            delta_event = AnthropicStreamEvent(
+                                type="content_block_delta",
+                                index=content_block_index,
+                                delta=AnthropicDelta(
+                                    type="text_delta",
+                                    text=retry_text,
+                                ),
+                            )
+                            yield _wrap_sse_event(
+                                delta_event.model_dump_json(exclude_none=True),
+                                "content_block_delta",
+                            )
+                            stop_event = AnthropicStreamEvent(
+                                type="content_block_stop",
+                                index=content_block_index,
+                            )
+                            yield _wrap_sse_event(
+                                stop_event.model_dump_json(exclude_none=True),
+                                "content_block_stop",
+                            )
+                    else:
+                        # Retry disabled, errored, timed out, or also produced
+                        # thinking-only. Fall back to the v10 placeholder.
+                        logger.warning(
+                            "Anthropic stream finished with only a thinking block "
+                            "and retry produced no usable content; injecting "
+                            "fallback text block to satisfy strict clients."
+                        )
+                        content_block_index += 1
+                        start_event = AnthropicStreamEvent(
+                            type="content_block_start",
+                            index=content_block_index,
+                            content_block=AnthropicContentBlock(type="text", text=""),
+                        )
+                        yield _wrap_sse_event(
+                            start_event.model_dump_json(exclude_none=True),
+                            "content_block_start",
+                        )
+                        delta_event = AnthropicStreamEvent(
+                            type="content_block_delta",
+                            index=content_block_index,
+                            delta=AnthropicDelta(
+                                type="text_delta",
+                                text=ANTHROPIC_EMPTY_TEXT_FALLBACK,
+                            ),
+                        )
+                        yield _wrap_sse_event(
+                            delta_event.model_dump_json(exclude_none=True),
+                            "content_block_delta",
+                        )
+                        stop_event = AnthropicStreamEvent(
+                            type="content_block_stop",
+                            index=content_block_index,
+                        )
+                        yield _wrap_sse_event(
+                            stop_event.model_dump_json(exclude_none=True),
+                            "content_block_stop",
+                        )
 
                 # Emit message_delta with stop_reason and usage
                 stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
@@ -636,6 +944,7 @@ class AnthropicServing:
                     delta_event.model_dump_json(exclude_none=True),
                     "content_block_delta",
                 )
+                emitted_thinking = True
                 # If the chunk also carried text/tool_calls fall through;
                 # otherwise skip the empty branches below.
                 if not delta.tool_calls and not delta.content:
@@ -679,6 +988,7 @@ class AnthropicServing:
                         )
                         content_block_open = True
                         content_block_type = "tool_use"
+                        emitted_text_or_tool = True
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
@@ -759,11 +1069,149 @@ class AnthropicServing:
                     delta_event.model_dump_json(exclude_none=True),
                     "content_block_delta",
                 )
+                emitted_text_or_tool = True
+
+    async def _retry_thinking_only(
+        self,
+        original_chat_request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> Optional[ChatCompletionResponse]:
+        """Re-issue the request non-streaming with a fresh seed and bumped
+        temperature.
+
+        Called after the primary generation produced only a thinking block.
+        Qwen3.6's short-thinking-stop is intermittent and seed-sensitive, so
+        one perturbed retry typically yields a healthy thinking+content turn.
+
+        Returns:
+            The retry's ChatCompletionResponse on success, or None if the
+            retry errored, timed out, or returned a non-response (e.g. an
+            internal error from the OpenAI handler). Caller falls back to the
+            placeholder text on None.
+        """
+        try:
+            # Deep-copy so mutating sampling params on the retry can't leak
+            # back into any in-flight state of the original request.
+            retry_request = original_chat_request.model_copy(deep=True)
+
+            # Force non-streaming so we get one consolidated response we can
+            # convert with _convert_response().
+            retry_request.stream = False
+            retry_request.stream_options = None
+
+            # New seed: bump if caller set one, otherwise pick fresh.
+            if retry_request.seed is not None:
+                retry_request.seed = (retry_request.seed + 1) & 0x7FFFFFFF
+            else:
+                retry_request.seed = random.randint(0, 2**31 - 1)
+
+            # Bump temperature within a ceiling. If the original was unset,
+            # the backend default (typically 1.0) applies; we still bump from
+            # the explicit base of 1.0 in that case for consistency with how
+            # the model was actually sampled the first time.
+            base_temp = (
+                retry_request.temperature
+                if retry_request.temperature is not None
+                else 1.0
+            )
+            retry_request.temperature = min(
+                base_temp + ANTHROPIC_THINKING_RETRY_TEMP_BUMP,
+                ANTHROPIC_THINKING_RETRY_TEMP_CEILING,
+            )
+
+            logger.warning(
+                "Anthropic thinking-only detected; retrying with seed=%s temp=%.3f "
+                "(timeout=%.0fs)",
+                retry_request.seed,
+                retry_request.temperature,
+                ANTHROPIC_THINKING_RETRY_TIMEOUT_S,
+            )
+
+            async def _run_retry() -> Optional[ChatCompletionResponse]:
+                # Re-validate after mutation — cheap and protects against
+                # accidental drift if validation rules grow.
+                err = self.openai_serving_chat._validate_request(retry_request)
+                if err:
+                    logger.warning(
+                        "Anthropic thinking-only retry: validation failed: %s",
+                        err,
+                    )
+                    return None
+
+                adapted, processed = (
+                    self.openai_serving_chat._convert_to_internal_request(
+                        retry_request, raw_request
+                    )
+                )
+                adapted.received_time = monotonic_time()
+                adapted.received_time_perf = time.perf_counter()
+                adapted.validation_time = 0.0
+
+                resp = await self.openai_serving_chat._handle_non_streaming_request(
+                    adapted, processed, raw_request
+                )
+                if not isinstance(resp, ChatCompletionResponse):
+                    logger.warning(
+                        "Anthropic thinking-only retry: non-response result "
+                        "(likely an error from the OpenAI handler); "
+                        "falling back to placeholder."
+                    )
+                    return None
+                return resp
+
+            return await asyncio.wait_for(
+                _run_retry(), timeout=ANTHROPIC_THINKING_RETRY_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Anthropic thinking-only retry timed out after %.0fs; "
+                "falling back to placeholder text.",
+                ANTHROPIC_THINKING_RETRY_TIMEOUT_S,
+            )
+            return None
+        except Exception as e:
+            logger.exception(
+                "Anthropic thinking-only retry raised; falling back to "
+                "placeholder text. Error: %s",
+                e,
+            )
+            return None
+
+    @staticmethod
+    def _extract_retry_payload(
+        retry_response: ChatCompletionResponse,
+    ) -> tuple[Optional[str], list]:
+        """Pull text + tool_calls out of a retry response.
+
+        Returns a (text, tool_calls) tuple where either may be empty/None.
+        Reasoning content from the retry is intentionally discarded: the
+        original thinking block has already been streamed to the client and
+        we want to replace only the missing text/tool segment.
+        """
+        if not retry_response.choices:
+            return None, []
+        msg = retry_response.choices[0].message
+        text = (msg.content or None) if isinstance(msg.content, str) else None
+        if text is not None and text.strip() == "":
+            text = None
+        tool_calls = list(msg.tool_calls or [])
+        return text, tool_calls
 
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self,
+        response: ChatCompletionResponse,
+        inject_fallback: bool = True,
     ) -> AnthropicMessagesResponse:
-        """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
+        """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response.
+
+        Args:
+            response: The OpenAI-format response from the local handler.
+            inject_fallback: When True (the default — used by any external
+                caller of this method), append the static placeholder text
+                block on thinking-only responses. _handle_non_streaming
+                passes False so it can attempt a retry first and inject the
+                placeholder only as a last resort.
+        """
         if not response.choices:
             return AnthropicMessagesResponse(
                 content=[AnthropicContentBlock(type="text", text="")],
@@ -774,6 +1222,16 @@ class AnthropicServing:
 
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
+
+        # Add thinking content from reasoning_content (extended thinking).
+        # Non-streaming responses carry reasoning on the assistant message;
+        # without this branch the trace is silently dropped (the streaming
+        # path already surfaces it as a thinking block).
+        reasoning_text = getattr(choice.message, "reasoning_content", None)
+        if reasoning_text:
+            content.append(
+                AnthropicContentBlock(type="thinking", thinking=reasoning_text)
+            )
 
         # Add text content
         if choice.message.content:
@@ -797,6 +1255,32 @@ class AnthropicServing:
                         input=tool_input,
                     )
                 )
+
+        # Fallback: if the response carries only a thinking block (no text,
+        # no tool_use), strict Anthropic clients silently drop the turn.
+        # The primary path is _handle_non_streaming's retry; this static
+        # placeholder is the last-resort safety net. Callers that drive
+        # their own retry pass inject_fallback=False and append later.
+        has_thinking = any(b.type == "thinking" for b in content)
+        has_text_or_tool = any(
+            b.type in ("text", "tool_use") for b in content
+        )
+        if inject_fallback and has_thinking and not has_text_or_tool:
+            logger.warning(
+                "Anthropic non-streaming response has only a thinking block; "
+                "injecting fallback text block to satisfy strict clients."
+            )
+            content.append(
+                AnthropicContentBlock(
+                    type="text", text=ANTHROPIC_EMPTY_TEXT_FALLBACK
+                )
+            )
+
+        # If we have no content at all (no thinking, no text, no tool_use),
+        # emit an empty text block so the response is structurally valid.
+        # Callers controlling fallback themselves manage this case post-hoc.
+        if inject_fallback and not content:
+            content.append(AnthropicContentBlock(type="text", text=""))
 
         # Map stop reason
         stop_reason = STOP_REASON_MAP.get(choice.finish_reason or "stop", "end_turn")

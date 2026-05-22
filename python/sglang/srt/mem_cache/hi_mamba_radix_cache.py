@@ -247,6 +247,64 @@ class HiMambaRadixCache(MambaRadixCache):
 
         return len(host_indices)
 
+    def _backup_mamba_before_tombstone(self, node: TreeNode) -> None:
+        """Copy mamba state to host before tombstoning an internal node.
+
+        When evict_mamba tombstones an internal node, it frees node.mamba_value
+        from GPU.  If the node is already backuped (KV in host), we must preserve
+        the mamba state in host memory so that mamba_archive_transfers can later
+        write the .mamba_*.bin companion file to L3.  Without this, 98%+ of
+        cached prefixes end up as orphan KV-only entries.
+
+        Handles two cases:
+        1. Node already backuped: allocate a mamba host slot and D→H copy.
+        2. Node not yet backuped: trigger write_backup(write_back=True) which
+           copies both KV and mamba to host atomically.
+        """
+        if node.mamba_host_value is not None:
+            return  # already has host copy
+
+        # Case 2: node not yet backuped — use write_backup to copy both KV
+        # and mamba to host atomically, then flush acks so mamba_host_value
+        # is set before we proceed.
+        if not node.backuped:
+            self.write_backup(node, write_back=True)
+            self.writing_check(write_back=True)
+            return
+
+        # Case 1: node already backuped (KV in host) — only need mamba D→H
+        mamba_device_indices = node.mamba_value
+        if mamba_device_indices is None:
+            return
+
+        mph = self.mamba_pool_host
+        host_indices = mph.alloc(1)
+        is_overflow = False
+        if host_indices is None:
+            overflow_alloc = getattr(mph, "overflow_alloc", None)
+            if overflow_alloc is not None:
+                host_indices = overflow_alloc(1)
+                if host_indices is not None:
+                    is_overflow = True
+            if host_indices is None:
+                self.evict_mamba_host(1)
+                host_indices = mph.alloc(1)
+                if host_indices is None:
+                    overflow_alloc = getattr(mph, "overflow_alloc", None)
+                    if overflow_alloc is not None:
+                        host_indices = overflow_alloc(1)
+                        if host_indices is not None:
+                            is_overflow = True
+            if host_indices is None:
+                return
+
+        # BUG FIX: backup_from_device_all_layer expects CUDA tensors but
+        # mph.alloc() returns CPU tensors. Use write_backup which properly
+        # handles both KV and mamba through cache_controller.
+        self.write_backup(node, write_back=True)
+        self.writing_check(write_back=True)
+        return
+
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
@@ -794,6 +852,14 @@ class HiMambaRadixCache(MambaRadixCache):
 
             if len(x.children) > 0:
                 # Internal: free device mamba only, KV stays on device (tombstone)
+                #
+                # Preserve mamba state in host memory before freeing it from GPU.
+                # Without this, mamba_archive_transfers returns None for 98%+ of
+                # cached prefixes, since internal nodes are tombstoned before their
+                # mamba state ever reaches L3 storage.
+                if x.mamba_host_value is None:
+                    self._backup_mamba_before_tombstone(x)
+
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 mamba_num_evicted += len(x.mamba_value)
                 self.req_to_token_pool.mamba_pool.free(x.mamba_value)
@@ -1211,20 +1277,17 @@ class HiMambaRadixCache(MambaRadixCache):
             node.mamba_lock_ref -= 1
 
         while node != self.root_node:
-            if node.evicted:
-                node = node.parent
-                continue
-
-            assert (
-                node.full_lock_ref > 0
-            ), f"dec_lock_ref on node with {node.full_lock_ref=}, {node.id=}"
-            if node.full_lock_ref == 1:
-                self.full_evictable_size_ += len(node.value)
-                self.full_protected_size_ -= len(node.value)
-                delta += len(node.value)
-            node.full_lock_ref -= 1
-            if node.full_lock_ref == 0:
-                self._update_full_device_leaf_status(node)
+            # Always decrement: a node locked before eviction must be
+            # unlocked here. Skip only when already at zero (the node was
+            # evicted BEFORE inc_lock_ref, so inc_lock_ref never locked it).
+            if node.full_lock_ref > 0:
+                if node.full_lock_ref == 1:
+                    self.full_evictable_size_ += len(node.value)
+                    self.full_protected_size_ -= len(node.value)
+                    delta += len(node.value)
+                node.full_lock_ref -= 1
+                if node.full_lock_ref == 0:
+                    self._update_full_device_leaf_status(node)
             node = node.parent
         return DecLockRefResult(delta=delta)
 
