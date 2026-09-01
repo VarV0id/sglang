@@ -818,8 +818,21 @@ class MambaComponent(TreeComponent):
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
                 cd = node.component_data[ct]
+                tr = transfers[0]
+                if tr.overflow_slot_ids:
+                    # Ring slots recycle as soon as the H->S archive acks, so
+                    # they can never serve host->device restores: do NOT mark
+                    # the node mamba-backuped. Stash for the BACKUP_STORAGE
+                    # build, which re-attaches the slot ids for ring release.
+                    cd.metadata["_mamba_overflow_indices"] = (
+                        tr.host_indices.clone()
+                    )
+                    cd.metadata["_mamba_overflow_slot_ids"] = list(
+                        tr.overflow_slot_ids
+                    )
+                    return
                 if cd.host_value is None:
-                    cd.host_value = transfers[0].host_indices.clone()
+                    cd.host_value = tr.host_indices.clone()
 
         elif phase == CacheTransferPhase.BACKUP_STORAGE:
             cd = node.component_data[ct]
