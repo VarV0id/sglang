@@ -335,7 +335,6 @@ class MambaPoolHost(HostKVCache):
                 if indices_cpu.numel() == 0:
                     return 0
 
-        self.slot_used[indices_cpu] = False
         self.release_slots.append(indices_cpu)
         self.num_release_slots += len(indices_cpu)
         return len(indices)
