@@ -1110,7 +1110,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
-            if req.mamba_pool_idx is None:
+            if req.kv.mamba_pool_idx is None:
                 dst_index = self._alloc_with_evict(
                     self.req_to_token_pool.mamba_pool,
                     1,
@@ -1120,10 +1120,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
                 src_index = mamba_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                req.mamba_pool_idx = dst_index[0]
+                req.kv.mamba_pool_idx = dst_index[0]
             else:
                 src_index = mamba_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
+                dst_index = req.kv.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
         value = value[:best_value_len]
@@ -2270,8 +2270,8 @@ class HiMambaRadixCache(MambaRadixCache):
             and last_hit_node in nodes_to_restore
             and last_hit_node.mamba_host_value is not None
         ):
-            if req.mamba_pool_idx is None:
-                req.mamba_pool_idx = self._alloc_with_evict(
+            if req.kv.mamba_pool_idx is None:
+                req.kv.mamba_pool_idx = self._alloc_with_evict(
                     self.req_to_token_pool.mamba_pool,
                     len(last_hit_node.mamba_host_value),
                     self.evict_mamba,
@@ -2282,7 +2282,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 PoolTransfer(
                     name=PoolName.MAMBA,
                     host_indices=last_hit_node.mamba_host_value,
-                    device_indices=req.mamba_pool_idx.unsqueeze(0),
+                    device_indices=req.kv.mamba_pool_idx.unsqueeze(0),
                 )
             )
 
