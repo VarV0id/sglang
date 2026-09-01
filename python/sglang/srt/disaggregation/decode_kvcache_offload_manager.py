@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -90,7 +91,7 @@ class DecodeKVCacheOffloadManager:
             model_name=get_serving().served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
             hicache_prefetch_capacity_tokens=getattr(
-                server_args, "hicache_prefetch_capacity_tokens", 0
+                get_global_server_args(), "hicache_prefetch_capacity_tokens", 0
             ),
         )
 
