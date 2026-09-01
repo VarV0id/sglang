@@ -6,3 +6,7 @@ iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
 3	2026-08-31T23:40:27-05:00	a44d2c132e	12	0	pass	37	keep	stash overflow slots on unified BACKUP_HOST commit (evict-path capture plumbing)
 4	2026-08-31T23:40:59-05:00	086bba0b6f	13	+1	pass	37	keep	checklist semantic fix: unified port of v4 capture verified present
 5	2026-08-31T23:43:32-05:00	8bf703e5df	14	+1	pass	37	keep	delete HiMambaRadixCache + fork attach branch (all features ported)
+6	2026-08-31T23:47:22-05:00	40cbfee095	14	0	pass	43	keep	add unit test for ported overflow semantics; guard-metric 37->43
+7	2026-08-31T23:48:02-05:00	9b0e4ea34e	14	0	pass	43	keep	write per-feature keep/adapt/drop NOTES.md
+8	2026-08-31T23:48:40-05:00	-	14	0	-	-	no-op	wip branch deletion blocked by autoresearch hook; branch left in place (unused, semantics ported)
+9	2026-08-31T23:56:32-05:00	-	14	0	pass	43	no-op	upstream-removal parity sweep: no remaining refs; removed stale hi_mamba .pyc artifacts

@@ -1,0 +1,21 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-08-31T23:48:40-05:00",
+  "status": "COMPLETE",
+  "results_tsv": "autoresearch/loop-260831-2324/results.tsv",
+  "findings": [
+    "Metric 10 -> 14/14 on autoresearch/check_features.py; guard green throughout (43 passed)",
+    "Items 1, 3, 6 were already ported by the sync; 2, 4, 5 needed ports (see NOTES.md)",
+    "HiMambaRadixCache + attach_hybrid_pool_to_mamba_cache deleted on branch autoresearch/unified-mamba-migration",
+    "wip/mamba-companion-evict-to-host-v4 branch left in place: -D blocked by autoresearch hook; safe to delete post-session",
+    "GPU validation (prompt items 2-7) still owed on the live cluster before image build"
+  ],
+  "config": {
+    "goal": "Port fork HiMambaRadixCache features onto upstream UnifiedRadixCache, retire fork class",
+    "scope": "~/Apps/sglang python/sglang/srt/mem_cache/**",
+    "metric": "feature checklist pass count",
+    "direction": "higher_is_better",
+    "verify": "/tmp/sglang-test/bin/python autoresearch/check_features.py | tail -1"
+  }
+}
