@@ -230,17 +230,23 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # step) before break fns with rank-coupled collectives and hard
             # timeouts (DeepEP NORMAL: 100s). Capture-only; replay bypasses
             # this wrapper.
-            if capture._barrier_fn is not None:
-                capture._barrier_fn()
+            try:
+                if capture._barrier_fn is not None:
+                    capture._barrier_fn()
 
-            # Run the break once so its outputs are allocated and their
-            # addresses recorded. A capture_stub replaces the body during
-            # capture (contents are never consumed; warmup and replay run
-            # the real inner), letting rank-coupled bodies skip the work.
-            if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
-            else:
-                output = inner(*args, **kwargs)
+                # Run the break once so its outputs are allocated and their
+                # addresses recorded. A capture_stub replaces the body during
+                # capture (contents are never consumed; warmup and replay run
+                # the real inner), letting rank-coupled bodies skip the work.
+                if capture_stub is not None:
+                    output = capture_stub(*args, **kwargs)
+                else:
+                    output = inner(*args, **kwargs)
+            except BaseException:
+                # Abort the capture session cleanly so __exit__ doesn't
+                # double-end a segment and the original exception surfaces.
+                capture._abort()
+                raise
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -358,6 +364,20 @@ class BreakableCUDAGraphCapture:
             _uninstall_wait_stream_hook()
         return False
 
+    def _abort(self) -> None:
+        # Best-effort abort of the in-flight segment capture. Called from the
+        # eager-on-graph break wrapper when the break body (or the TP barrier
+        # before it) raises. Ends the CUDA-level capture if one is active,
+        # then clears state so __exit__ skips _end_current_segment.
+        graph = self._current_graph
+        self._current_graph = None
+        self._current_graph_needs_instantiate = False
+        if graph is not None:
+            try:
+                graph.capture_end()
+            except Exception:
+                pass  # capture may already be invalidated; nothing to salvage
+
     def _begin_new_segment(self) -> None:
         graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
@@ -393,8 +413,21 @@ class BreakableCUDAGraphCapture:
                     _original_wait_stream(main_stream, side)
             forked.clear()
         graph = self._current_graph
-        assert graph is not None
-        graph.capture_end()
+        if graph is None:
+            # Tolerate double-end (e.g. eager-break abort already ended the
+            # segment, or a prior capture_end failure cleared state). Fork
+            # hardening for hybrid GDN capture desync; see k8s-infra
+            # .planning/quick/260901-pcg-breakable-gdn/RESEARCH.md (P1).
+            return
+        try:
+            graph.capture_end()
+        except Exception:
+            # Don't leave a stale graph for __exit__ to double-end, and let the
+            # REAL exception (with its own stack) propagate instead of a
+            # misleading allocator assert one segment later.
+            self._current_graph = None
+            self._current_graph_needs_instantiate = False
+            raise
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False

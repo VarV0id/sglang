@@ -656,7 +656,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if (
             _is_cpu
             or _is_npu
+            # Dual-stream must also stay off under breakable prefill capture:
+            # capture records the single-stream path, but replay enters
+            # get_is_capture_mode()=True and would fork to the alt stream,
+            # diverging addresses from what the graph recorded. Fork patch,
+            # see k8s-infra .planning/quick/260901-pcg-breakable-gdn (P4).
             or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
         ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
