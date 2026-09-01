@@ -636,7 +636,7 @@ class MambaRadixCache(BasePrefixCache):
                     "See fix(strip_thinking_cache) history in fork.",
                     cache_len,
                     page_aligned_len,
-                    kv_committed_len,
+                    kv_len_to_handle,
                     len(req.origin_input_ids),
                     len(req.output_ids),
                 )
