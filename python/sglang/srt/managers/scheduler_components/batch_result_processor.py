@@ -13,6 +13,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.server_args import get_global_server_args
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
