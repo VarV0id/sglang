@@ -58,9 +58,13 @@ check("prefetch_capacity_wired",
              r"def attach_hybrid_pool_to_unified_cache[\s\S]*?hicache_prefetch_capacity_tokens"))
 
 # 5. Eviction-path mamba capture (v4 semantics) on unified path
+# v4 leaf-demotion capture, unified: BACKUP_HOST commit stashes overflow ring
+# slots in ComponentData.metadata instead of marking the node backuped, and
+# BACKUP_STORAGE re-attaches overflow_slot_ids for ring release after archive.
 check("evict_to_host_capture",
-      has(UNI / "components/mamba_component.py", r"evict_to_host|leaf.demot|demot")
-      and has(UNI / "components/mamba_component.py", r"mamba_host_value|_backup_mamba_before_tombstone|tombstone"))
+      has(UNI / "components/mamba_component.py",
+          r"_mamba_overflow_indices", r"_mamba_overflow_slot_ids",
+          r"BACKUP_HOST", r"BACKUP_STORAGE"))
 
 # 6. Prompt anchor machinery
 check("prompt_anchor",
