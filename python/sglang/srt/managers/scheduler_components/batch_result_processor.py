@@ -1280,27 +1280,63 @@ class SchedulerBatchResultProcessor:
                     )
                 )
                 req.kv.mamba_last_track_seqlen = seq_len
-            elif (
-                not batch.spec_algorithm.is_none()
-                and result.num_correct_drafts_per_req_cpu is not None
-            ):
-                req.mamba_lazy_is_insert = False
-            return
+            elif not batch.spec_algorithm.is_none():
+                # Spec decode: restore the lazy ping-pong promotion logic
+                # (upstream 8f3d3a31f4 `_mamba_lazy_spec_update`) that the
+                # merge gutted, adapted to the fork's `req.kv.*` namespace.
+                # Without it `crossed`/`planned_pos`/`track_seqlen` were
+                # undefined and spec decode crashed on the first mti
+                # boundary crossing.
+                crossed, track_seqlen = self._mamba_check_track_boundary(
+                    req, batch, result, i
+                )
 
-        if not crossed or planned_pos is None:
+                positions = batch.mamba_lazy_spec_track_positions_cpu
+                planned_pos = (
+                    positions[i]
+                    if positions is not None and i < len(positions)
+                    else None  # filtered/merged snapshot without a plan: be conservative
+                )
+
+                if req.finished():
+                    # Skip the donation if a scatter wrote or may still write
+                    # the keep slot.
+                    keep_written_by_this_step = (
+                        crossed and planned_pos == req.kv.mamba_next_track_idx
+                    )
+                    other_idx = 1 - req.kv.mamba_next_track_idx
+                    # Recompute the in-flight verify's plan (kv_committed_len
+                    # is frozen since its prepare, so the recompute is exact).
+                    keep_may_be_written_in_flight = req.kv.mamba_ping_pong_track_buffer[
+                        other_idx
+                    ].item() == -1 and mamba_lazy_spec_in_window(
+                        req,
+                        get_global_server_args().mamba_track_interval,
+                        max_speculative_num_draft_tokens(),
+                    )
+                    if (
+                        planned_pos is None
+                        or keep_written_by_this_step
+                        or keep_may_be_written_in_flight
+                    ):
+                        req.mamba_lazy_is_insert = False
+                    return
+
+                if not crossed or planned_pos is None:
+                    return
+                if planned_pos != req.kv.mamba_next_track_idx:
+                    # Promote pending -> keep: free the old checkpoint, repoint.
+                    pool = batch.req_to_token_pool
+                    keep_idx = req.kv.mamba_next_track_idx
+                    keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
+                    pool.mamba_allocator.free(keep_val.unsqueeze(0))
+                    pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
+                    req.kv.mamba_next_track_idx = planned_pos
+                # else: in-place fallback, or promoted by an earlier confirmation —
+                # keep holds the track_seqlen state either way.
+                req.kv.mamba_last_track_idx = planned_pos
+                req.kv.mamba_last_track_seqlen = track_seqlen
             return
-        if planned_pos != req.kv.mamba_next_track_idx:
-            # Promote pending -> keep: free the old checkpoint, repoint.
-            pool = batch.req_to_token_pool
-            keep_idx = req.kv.mamba_next_track_idx
-            keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
-            pool.mamba_allocator.free(keep_val.unsqueeze(0))
-            pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
-            req.kv.mamba_next_track_idx = planned_pos
-        # else: in-place fallback, or promoted by an earlier confirmation —
-        # keep holds the track_seqlen state either way.
-        req.kv.mamba_last_track_idx = planned_pos
-        req.kv.mamba_last_track_seqlen = track_seqlen
 
     @staticmethod
     def _mamba_assert_committed_len_lookahead(req: Req) -> None:
