@@ -28,8 +28,11 @@ check("lru_file_backend",
       and has(MC / "storage/backend_factory.py", '"lru_file"', r"lru_file\.py|storage\.lru_file|lru_file\""))
 
 # 2. Mamba companion-file semantics on unified path
+# Companion-file semantics on the unified path = BACKUP_STORAGE phase building a
+# MAMBA PoolTransfer (upstream base) + fork overflow fall-through (ported).
 check("companion_write_read",
-      has(UNI / "components/mamba_component.py", r"mamba_archive_transfers|write_backup_storage|mamba.*companion|companion.*mamba"))
+      has(UNI / "components/mamba_component.py",
+          r"BACKUP_STORAGE", r"PoolName\.MAMBA", r"overflow_slot_ids"))
 check("orphan_kv_guard",
       has(MC / "hybrid_cache/hybrid_cache_controller.py", r"pool_transfers"))
 check("mamba_boundary_clamp",

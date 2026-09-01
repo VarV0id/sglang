@@ -762,7 +762,24 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_STORAGE:
             cd = node.component_data[ct]
-            if cd.host_value is None or not node.hash_value:
+            if not node.hash_value:
+                return None
+            # Overflow-backed nodes keep their state in the reserved tail ring
+            # (host_value is None); re-attach the slot ids so the completion
+            # drain can release them back to the ring after the H->S write.
+            overflow_indices = cd.metadata.get("_mamba_overflow_indices")
+            overflow_slot_ids = cd.metadata.get("_mamba_overflow_slot_ids")
+            if overflow_indices is not None and overflow_slot_ids:
+                return [
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        host_indices=overflow_indices,
+                        keys=[node.hash_value[-1]],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                        overflow_slot_ids=list(overflow_slot_ids),
+                    )
+                ]
+            if cd.host_value is None:
                 return None
             return [
                 PoolTransfer(
@@ -803,6 +820,11 @@ class MambaComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+
+        elif phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.metadata.pop("_mamba_overflow_indices", None) is not None:
+                cd.metadata.pop("_mamba_overflow_slot_ids", None)
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
