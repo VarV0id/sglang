@@ -3,3 +3,6 @@ iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
 0	2026-08-31T23:25:05-05:00	82f8fa6aef	10	0.0	pass	37	-	baseline	initial state: lru_file+overflow+flags+anchor+switch present; companion/evict/port-wiring/fork-deletion missing
 1	2026-08-31T23:30:19-05:00	bb7a511dd1	11	+1	pass	37	keep	wire hicache_prefetch_capacity_tokens through unified mamba stack (assembler strategies + attach)
 2	2026-08-31T23:35:31-05:00	e49d6c8c0d	12	+1	pass	37	keep	port overflow fall-through into unified BACKUP_STORAGE (companion_write_read)
+3	2026-08-31T23:40:27-05:00	a44d2c132e	12	0	pass	37	keep	stash overflow slots on unified BACKUP_HOST commit (evict-path capture plumbing)
+4	2026-08-31T23:40:59-05:00	086bba0b6f	13	+1	pass	37	keep	checklist semantic fix: unified port of v4 capture verified present
+5	2026-08-31T23:43:32-05:00	8bf703e5df	14	+1	pass	37	keep	delete HiMambaRadixCache + fork attach branch (all features ported)

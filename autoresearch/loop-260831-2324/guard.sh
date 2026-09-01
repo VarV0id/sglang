@@ -26,6 +26,7 @@ print('imports OK')
 out=$(PYTHONPATH=python timeout 900 $PY -m pytest \
   test/registered/unit/mem_cache/test_unified_mamba_views.py \
   test/registered/unit/mem_cache/test_hicache_file_lru_unit.py \
+  test/registered/unit/mem_cache/test_unified_mamba_overflow_backup.py \
   -q --no-header -p no:cacheprovider 2>&1 | tail -2)
 echo "$out" >&2
 passed=$(echo "$out" | grep -oP '\d+(?= passed)' | head -1)
