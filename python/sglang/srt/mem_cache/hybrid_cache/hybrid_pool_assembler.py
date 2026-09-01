@@ -1458,6 +1458,7 @@ class StackStrategy:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         enable_storage_metrics: bool = False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ) -> StackBuildResult:
         raise NotImplementedError
 
@@ -1493,6 +1494,7 @@ class _DeepSeekV4Strategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         layer_mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
         host_pool_group, cache_controller = build_deepseek_v4_hicache_stack(
@@ -1568,6 +1570,7 @@ class _MambaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
@@ -1586,6 +1589,7 @@ class _MambaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            hicache_prefetch_capacity_tokens=hicache_prefetch_capacity_tokens,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -1634,6 +1638,7 @@ class _SwaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
         host_pool_group, cache_controller = build_hybrid_swa_stack(
@@ -1693,6 +1698,7 @@ class _MambaSwaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
@@ -1764,6 +1770,7 @@ class _DsaStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -1828,6 +1835,7 @@ class _MiniMaxSparseStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
             params=params,
@@ -1899,6 +1907,7 @@ class _PlainKvStrategy(StackStrategy):
         prefetch_threshold=256,
         model_name=None,
         enable_storage_metrics=False,
+        hicache_prefetch_capacity_tokens: int = 0,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
@@ -2012,6 +2021,9 @@ def attach_hybrid_pool_to_unified_cache(
             prefetch_threshold=storage_prefetch_threshold,
             model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
+            hicache_prefetch_capacity_tokens=getattr(
+                server_args, "hicache_prefetch_capacity_tokens", 0
+            ),
         )
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:
