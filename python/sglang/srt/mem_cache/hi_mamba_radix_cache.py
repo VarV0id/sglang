@@ -589,6 +589,57 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.full_lru_list.in_list(node):
             self.full_lru_list.remove_node(node)
 
+        # Patch #29 (v4): synchronous mamba D->H copy before freeing device mamba
+        # on leaf GPU->CPU demotion. _evict_to_host is the dominant eviction path
+        # under write_through for backuped leaves. Without this, _free_device_mamba
+        # frees node.mamba_value with no host copy -> mamba_host_value stays None
+        # -> mamba_archive_transfers returns None -> orphan KV-only L3.
+        # v1: _backup_mamba_before_tombstone -> write_backup conflict.
+        # v3: cache_controller.write(dummy KV) -> async, not tracked in
+        # ongoing_write_through so writing_check returns without draining.
+        # v4: direct synchronous D->H copy: allocate host slot (with overflow
+        # and evict fallbacks), call mamba_pool_host.backup_from_device_all_layer,
+        # torch.cuda.synchronize(), set mamba_host_value, then archive to L3.
+        if node.mamba_host_value is None and node.mamba_value is not None:
+            mph = self.mamba_pool_host
+            host_idx = mph.alloc(1)
+            if host_idx is None:
+                overflow_alloc = getattr(mph, "overflow_alloc", None)
+                if overflow_alloc is not None:
+                    host_idx = overflow_alloc(1)
+            if host_idx is None:
+                self.evict_mamba_host(1)
+                host_idx = mph.alloc(1)
+                if host_idx is None:
+                    overflow_alloc = getattr(mph, "overflow_alloc", None)
+                    if overflow_alloc is not None:
+                        host_idx = overflow_alloc(1)
+            if host_idx is not None:
+                # Patch #29 (v5): mph.alloc() returns a CPU int64 slot index, but
+                # backup_from_device_all_layer feeds dst_indices straight into the
+                # CUDA hicache transfer kernel (run_all, hicache.cuh) which asserts
+                # .with_device<kDLCUDA>. This direct call bypasses
+                # HiCacheController.move_indices() (the only host->device move), so a
+                # CPU host_idx triggered "Device mismatch: expected cuda:0 but got cpu"
+                # at hicache.cuh:329 -> SIGQUIT -> pod restart (image v26). Move only
+                # the KERNEL ARGUMENT to device; keep node.mamba_host_value as the CPU
+                # slot index (it indexes the CPU host pool and is re-moved to device by
+                # move_indices on restore).
+                host_idx_dev = host_idx.to(
+                    self.req_to_token_pool.mamba_pool.device, non_blocking=True
+                )
+                mph.backup_from_device_all_layer(
+                    self.req_to_token_pool.mamba_pool,
+                    host_idx_dev,
+                    node.mamba_value,
+                    io_backend="kernel",
+                )
+                torch.cuda.synchronize()
+                node.mamba_host_value = host_idx.clone()
+                self.mamba_host_lru_list.insert_mru(node)
+                if self.enable_storage and node.hash_value:
+                    self.write_backup_storage(node)
+
         mamba_num = self._free_device_mamba(node)
 
         node.value = None
