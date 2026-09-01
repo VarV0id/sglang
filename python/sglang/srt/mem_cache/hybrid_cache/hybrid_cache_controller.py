@@ -595,6 +595,7 @@ class HybridCacheController(BaseHiCacheController):
 
         pool_transfers = self._resolve_device_transfers(
             extra_pools,
+            alloc_host=False,
             kv_device_indices=device_indices,
             kv_host_indices=host_indices,
         )
@@ -920,10 +921,20 @@ class HybridCacheController(BaseHiCacheController):
     def _resolve_device_transfers(
         self,
         extra_pools: Optional[list[PoolTransfer]],
+        alloc_host: bool = False,
         kv_device_indices: Optional[torch.Tensor] = None,
         kv_host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[list[PoolTransfer]]:
-        """Allocate unresolved side-pool device indices atomically."""
+        """Allocate unresolved side-pool device indices atomically.
+
+        ``alloc_host`` is preserved from the pre-refactor fork API: the write
+        (host-allocation) side is now handled by
+        ``HostPoolGroup.resolve_host_transfers`` (which carries the Alt B
+        overflow fallback), so callers on the H->D load path always pass
+        ``alloc_host=False``. The parameter is kept so the read-side
+        semantics below (no symmetric overflow concept — a missing companion
+        file is just a miss) remain explicit and keyed to it.
+        """
         if not extra_pools:
             return None
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []

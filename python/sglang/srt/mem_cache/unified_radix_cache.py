@@ -1304,6 +1304,7 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
         resolved = self.cache_controller._resolve_device_transfers(
             restored_transfers or None,
+            alloc_host=False,
             kv_device_indices=device_indices,
             kv_host_indices=backup.host_indices,
         )
