@@ -837,7 +837,16 @@ class MambaComponent(TreeComponent):
         elif phase == CacheTransferPhase.BACKUP_STORAGE:
             cd = node.component_data[ct]
             if cd.metadata.pop("_mamba_overflow_indices", None) is not None:
-                cd.metadata.pop("_mamba_overflow_slot_ids", None)
+                slot_ids = cd.metadata.pop("_mamba_overflow_slot_ids", None)
+                # Archive-completion drain the BACKUP_HOST stash promised:
+                # the H->S write has acked, so the overflow ring rows are
+                # safe to recycle. Release each stashed slot back to the ring.
+                if slot_ids:
+                    host_pool = self.cache.host_pool_group.get_pool(PoolName.MAMBA)
+                    overflow_release = getattr(host_pool, "overflow_release", None)
+                    if overflow_release is not None:
+                        for slot_idx in slot_ids:
+                            overflow_release(int(slot_idx))
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:

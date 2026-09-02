@@ -99,6 +99,106 @@ class TestMambaOverflowBackupStorage(unittest.TestCase):
 
     def test_commit_clears_stash(self):
         comp = _make_component()
+        # The BACKUP_STORAGE commit now drains stashed overflow slots via the
+        # host pool, so the component needs a cache with a mamba pool.
+        host_pool = MagicMock()
+        host_pool_group = MagicMock()
+        host_pool_group.get_pool = MagicMock(return_value=host_pool)
+        comp.cache = MagicMock(host_pool_group=host_pool_group)
+        node, cd = _make_node()
+        cd.metadata["_mamba_overflow_indices"] = torch.tensor([7])
+        cd.metadata["_mamba_overflow_slot_ids"] = [7]
+        comp.commit_hicache_transfer(
+            node, CacheTransferPhase.BACKUP_STORAGE, [], cache_actions=[]
+        )
+        self.assertEqual(cd.metadata, {})
+        host_pool.overflow_release.assert_called_once_with(7)
+
+
+class TestMambaOverflowBackupStorageReleasesRing(unittest.TestCase):
+    """Regression test for the overflow-ring slot leak.
+
+    Before the fix, a successful BACKUP_STORAGE commit dropped the stashed
+    ``_mamba_overflow_slot_ids`` on the floor without ever calling
+    ``overflow_release`` — so the 64-slot ring filled permanently after 64
+    overflow writes and every later companion write was skipped. The commit
+    must drain each stashed slot back to the ring.
+    """
+
+    def _make_component_with_overflow_ring(self, base_idx=100, size=64):
+        from sglang.srt.mem_cache._mamba_overflow_buffer import (
+            _MambaOverflowAllocator,
+        )
+
+        comp = _make_component()
+        ring = _MambaOverflowAllocator(base_idx, size)
+
+        host_pool = MagicMock()
+        host_pool.overflow_release = ring.release
+        host_pool_group = MagicMock()
+        host_pool_group.get_pool = MagicMock(return_value=host_pool)
+        cache = MagicMock()
+        cache.host_pool_group = host_pool_group
+        comp.cache = cache
+        return comp, ring, host_pool_group
+
+    def test_backup_storage_commit_releases_stashed_slots(self):
+        comp, ring, host_pool_group = self._make_component_with_overflow_ring()
+        # Simulate two slots acquired earlier via overflow_alloc: refcount 1.
+        slot_a = ring.acquire()
+        slot_b = ring.acquire()
+        self.assertEqual(ring.stats()["in_use_now"], 2)
+
+        node, cd = _make_node()
+        cd.metadata["_mamba_overflow_indices"] = torch.tensor([slot_a, slot_b])
+        cd.metadata["_mamba_overflow_slot_ids"] = [slot_a, slot_b]
+
+        comp.commit_hicache_transfer(
+            node, CacheTransferPhase.BACKUP_STORAGE, [], cache_actions=[]
+        )
+
+        # Both slots drained: refcounts back to 0, acquirable again.
+        self.assertEqual(ring.stats()["in_use_now"], 0)
+        self.assertEqual(cd.metadata, {})
+        host_pool_group.get_pool.assert_called_once_with(PoolName.MAMBA)
+        # Ring actually reusable: a fresh acquire succeeds where it would have
+        # returned None on a saturated (leaked) ring of size 2... verify via
+        # refcount instead: every stashed slot is releasable.
+        self.assertEqual(ring._refcounts, [0] * ring._size)
+
+    def test_backup_storage_commit_no_stash_is_noop(self):
+        comp, ring, host_pool_group = self._make_component_with_overflow_ring()
+        node, cd = _make_node()
+        cd.metadata["_mamba_overflow_indices"] = torch.tensor([5])
+        # No _mamba_overflow_slot_ids key at all -> release loop must not run.
+        comp.commit_hicache_transfer(
+            node, CacheTransferPhase.BACKUP_STORAGE, [], cache_actions=[]
+        )
+        self.assertEqual(cd.metadata, {})
+        host_pool_group.get_pool.assert_not_called()
+        self.assertEqual(ring.stats()["in_use_now"], 0)
+
+    def test_backup_storage_commit_no_overflow_stash_untouched(self):
+        # Node with no overflow metadata at all: commit is a pure no-op,
+        # host pool never consulted.
+        comp, _, host_pool_group = self._make_component_with_overflow_ring()
+        node, cd = _make_node()
+        comp.commit_hicache_transfer(
+            node, CacheTransferPhase.BACKUP_STORAGE, [], cache_actions=[]
+        )
+        self.assertEqual(cd.metadata, {})
+        host_pool_group.get_pool.assert_not_called()
+
+    def test_backup_storage_commit_pool_without_overflow_support(self):
+        # A pool lacking overflow_release (getattr -> None) must not crash.
+        comp = _make_component()
+        host_pool = object()  # plain object: no overflow_release attribute
+        host_pool_group = MagicMock()
+        host_pool_group.get_pool = MagicMock(return_value=host_pool)
+        cache = MagicMock()
+        cache.host_pool_group = host_pool_group
+        comp.cache = cache
+
         node, cd = _make_node()
         cd.metadata["_mamba_overflow_indices"] = torch.tensor([7])
         cd.metadata["_mamba_overflow_slot_ids"] = [7]
