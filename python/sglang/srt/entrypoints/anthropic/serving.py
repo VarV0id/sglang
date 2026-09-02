@@ -377,12 +377,18 @@ class AnthropicServing:
                         if image_part is not None:
                             tool_content_parts.append(image_part)
                     elif item_type == "tool_reference":
-                        # Anthropic uses `tool_name`; the SGLang chat template
-                        # matches on `name`. Translate at the boundary.
+                        # Anthropic uses `tool_name`; emit as text rather than a
+                        # structured part. Most chat templates (Qwen3.6
+                        # FableFusion among them) cannot render a
+                        # `tool_reference` content item and raise "Unexpected
+                        # item type in content." from the Jinja render. The
+                        # reference is citation metadata — the result payload
+                        # is already carried by the text/search_result parts,
+                        # so flattening to text loses nothing the model reads.
                         ref_name = item.get("tool_name") or item.get("name")
                         if ref_name:
                             tool_content_parts.append(
-                                {"type": "tool_reference", "name": ref_name}
+                                {"type": "text", "text": f"[tool: {ref_name}]"}
                             )
                     elif item_type == "search_result":
                         search_text = _text_from_search_result(item)
